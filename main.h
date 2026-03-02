@@ -73,8 +73,8 @@ struct TabData {
 
 	cairo_surface_t *image;
 
-	gint axiscoords[4][2]; 					// X,Y coordinates of axispoints
-	gint **points; 							// Indexes of graphpoints and their coordinates
+	gdouble axiscoords[4][2]; 				// X,Y coordinates of axispoints
+	gdouble **points; 						// Indexes of graphpoints and their coordinates
 	gint *lastpoints; 						// Indexes of last points put out
 	gint numpoints;
 	gint numlastpoints; 					// Number of points on graph and last put out
@@ -92,11 +92,12 @@ struct TabData {
 	gchar *file_name; 						// Pointer to filename
 	gchar FileNames[256];
 
-	gint mousePointerCoords[2];
+	gdouble mousePointerCoords[2];
+	gdouble viewZoom;
 
 	gint movedPointIndex;
-	gint movedOrigCoords[2];
-	gint movedOrigMousePtrCoords[2];
+	gdouble movedOrigCoords[2];
+	gdouble movedOrigMousePtrCoords[2];
 };
 
 struct ButtonData {

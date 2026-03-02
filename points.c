@@ -47,14 +47,15 @@ gint min(gint x, gint y) {
 /* This function calculates the true value of the point based	*/
 /* on the coordinates of the point on the bitmap.		*/
 /****************************************************************/
-struct PointValue calculatePointValue(gint Xpos, gint Ypos, struct TabData *tabData) {
+struct PointValue calculatePointValue(gdouble Xpos, gdouble Ypos,
+		struct TabData *tabData) {
 	double alpha, beta, x21, x43, y21, y43, rlc[4]; /* Declare help variables */
 	struct PointValue pointValue;
 
-	x21 = (double) tabData->axiscoords[1][0] - tabData->axiscoords[0][0]; /* Calculate deltax of x axis points */
-	y21 = (double) tabData->axiscoords[1][1] - tabData->axiscoords[0][1]; /* Calculate deltay of x axis points */
-	x43 = (double) tabData->axiscoords[3][0] - tabData->axiscoords[2][0]; /* Calculate deltax of y axis points */
-	y43 = (double) tabData->axiscoords[3][1] - tabData->axiscoords[2][1]; /* Calculate deltay of y axis points */
+	x21 = tabData->axiscoords[1][0] - tabData->axiscoords[0][0]; /* Calculate deltax of x axis points */
+	y21 = tabData->axiscoords[1][1] - tabData->axiscoords[0][1]; /* Calculate deltay of x axis points */
+	x43 = tabData->axiscoords[3][0] - tabData->axiscoords[2][0]; /* Calculate deltax of y axis points */
+	y43 = tabData->axiscoords[3][1] - tabData->axiscoords[2][1]; /* Calculate deltay of y axis points */
 
 	if (tabData->logxy[0]) { /* If x axis is logarithmic, store	*/
 		rlc[0] = log(tabData->realcoords[0]); /* recalculated values in rlc.		*/
@@ -72,11 +73,11 @@ struct PointValue calculatePointValue(gint Xpos, gint Ypos, struct TabData *tabD
 		rlc[3] = tabData->realcoords[3];
 	}
 
-	alpha = ((tabData->axiscoords[0][0] - (double) Xpos)
-			- (tabData->axiscoords[0][1] - (double) Ypos) * (x43 / y43)) / (x21
+	alpha = ((tabData->axiscoords[0][0] - Xpos)
+			- (tabData->axiscoords[0][1] - Ypos) * (x43 / y43)) / (x21
 			- ((y21 * x43) / y43));
-	beta = ((tabData->axiscoords[2][1] - (double) Ypos)
-			- (tabData->axiscoords[2][0] - (double) Xpos) * (y21 / x21)) / (y43
+	beta = ((tabData->axiscoords[2][1] - Ypos)
+			- (tabData->axiscoords[2][0] - Xpos) * (y21 / x21)) / (y43
 			- ((x43 * y21) / x21));
 
 	if (tabData->logxy[0])
@@ -89,11 +90,11 @@ struct PointValue calculatePointValue(gint Xpos, gint Ypos, struct TabData *tabD
 	else
 		pointValue.Yv = -beta * (rlc[3] - rlc[2]) + rlc[2];
 
-	alpha = ((tabData->axiscoords[0][0] - (double) (Xpos + 1))
-			- (tabData->axiscoords[0][1] - (double) (Ypos + 1)) * (x43 / y43))
+	alpha = ((tabData->axiscoords[0][0] - (Xpos + 1.0))
+			- (tabData->axiscoords[0][1] - (Ypos + 1.0)) * (x43 / y43))
 			/ (x21 - ((y21 * x43) / y43));
-	beta = ((tabData->axiscoords[2][1] - (double) (Ypos + 1))
-			- (tabData->axiscoords[2][0] - (double) (Xpos + 1)) * (y21 / x21))
+	beta = ((tabData->axiscoords[2][1] - (Ypos + 1.0))
+			- (tabData->axiscoords[2][0] - (Xpos + 1.0)) * (y21 / x21))
 			/ (y43 - ((x43 * y21) / x21));
 
 	if (tabData->logxy[0])
@@ -106,11 +107,11 @@ struct PointValue calculatePointValue(gint Xpos, gint Ypos, struct TabData *tabD
 	else
 		pointValue.Yerr = -beta * (rlc[3] - rlc[2]) + rlc[2];
 
-	alpha = ((tabData->axiscoords[0][0] - (double) (Xpos - 1))
-			- (tabData->axiscoords[0][1] - (double) (Ypos - 1)) * (x43 / y43))
+	alpha = ((tabData->axiscoords[0][0] - (Xpos - 1.0))
+			- (tabData->axiscoords[0][1] - (Ypos - 1.0)) * (x43 / y43))
 			/ (x21 - ((y21 * x43) / y43));
-	beta = ((tabData->axiscoords[2][1] - (double) (Ypos - 1))
-			- (tabData->axiscoords[2][0] - (double) (Xpos - 1)) * (y21 / x21))
+	beta = ((tabData->axiscoords[2][1] - (Ypos - 1.0))
+			- (tabData->axiscoords[2][0] - (Xpos - 1.0)) * (y21 / x21))
 			/ (y43 - ((x43 * y21) / x21));
 
 	if (tabData->logxy[0])
