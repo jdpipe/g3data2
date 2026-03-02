@@ -55,7 +55,12 @@ static const gdouble MAIN_IMAGE_MIN_ZOOM = 0.05;
 static const gdouble MAIN_IMAGE_MAX_ZOOM = 8.0;
 static const gdouble MAIN_IMAGE_ZOOM_STEP = 1.25;
 static const gdouble MAIN_IMAGE_CANVAS_MIN_PAD = 512.0;
-static const gint MAX_RECENT_FILES = 5;
+static const gint MAX_RECENT_FILES = 6;
+static const gint START_TILE_THUMB_W = 160;
+static const gint START_TILE_THUMB_H = 120;
+static const gint START_TILE_COLUMNS = 3;
+static const gint START_TILE_MIN_ITEM_W = 150;
+static const gint START_TILE_MAX_ITEM_W = 220;
 static const char *RECENT_GROUP = "RecentFiles";
 static const char *RECENT_PATH_KEY_FMT = "path_%d";
 static const char *RECENT_DATE_KEY_FMT = "date_%d";
@@ -79,6 +84,8 @@ GtkWidget *window;
 GtkWidget *mainnotebook;
 GtkWidget *close_menu_item;
 GtkWidget *file_menu_widget;
+GtkWidget *start_page_widget;
+GtkWidget *start_icon_view_widget;
 
 struct RecentFileEntry {
 	gchar *path;
@@ -201,6 +208,238 @@ static void clearRecentFileMenuItems(void) {
 	g_ptr_array_set_size(recent_menu_items, 0);
 }
 
+static gint countDataTabs(void) {
+	gint i, count;
+	count = 0;
+	if (mainnotebook == NULL)
+		return 0;
+	for (i = 0; i < gtk_notebook_get_n_pages(GTK_NOTEBOOK(mainnotebook)); i++) {
+		GtkWidget *page;
+		page = gtk_notebook_get_nth_page(GTK_NOTEBOOK(mainnotebook), i);
+		if (g_object_get_data(G_OBJECT(page), DATA_STORE_NAME) != NULL)
+			count++;
+	}
+	return count;
+}
+
+static void hideStartPage(void) {
+	GtkWidget *parent;
+	if (start_page_widget == NULL)
+		return;
+	parent = gtk_widget_get_parent(start_page_widget);
+	if (parent != NULL)
+		gtk_container_remove(GTK_CONTAINER(parent), start_page_widget);
+	start_page_widget = NULL;
+	start_icon_view_widget = NULL;
+	if (mainnotebook != NULL)
+		gtk_widget_show(mainnotebook);
+}
+
+static void openRecentPath(const gchar *path) {
+	if (path == NULL || *path == '\0')
+		return;
+	setupNewTab((char *) path, 1.0, -1, -1, FALSE, NULL, NULL, NULL);
+}
+
+static void updateStartIconViewLayout(GtkWidget *icon_view, gint host_width) {
+	gint available_w, columns, item_w;
+	const gint spacing = 10;
+	const gint margin = 6;
+
+	if (icon_view == NULL || host_width <= 1)
+		return;
+
+	available_w = host_width - 2 * margin;
+	if (available_w <= START_TILE_MIN_ITEM_W) {
+		columns = 1;
+	} else {
+		columns = available_w / START_TILE_MIN_ITEM_W;
+		if (columns < 1)
+			columns = 1;
+		if (columns > START_TILE_COLUMNS)
+			columns = START_TILE_COLUMNS;
+	}
+
+	item_w = (available_w - (columns - 1) * spacing) / columns;
+	if (item_w < START_TILE_MIN_ITEM_W)
+		item_w = START_TILE_MIN_ITEM_W;
+	if (item_w > START_TILE_MAX_ITEM_W)
+		item_w = START_TILE_MAX_ITEM_W;
+
+	gtk_icon_view_set_columns(GTK_ICON_VIEW(icon_view), columns);
+	gtk_icon_view_set_item_width(GTK_ICON_VIEW(icon_view), item_w);
+	gtk_widget_queue_resize(icon_view);
+	gtk_widget_queue_draw(icon_view);
+}
+
+static void startIconViewSizeAllocateEvent(GtkWidget *widget,
+		GtkAllocation *allocation, gpointer data) {
+	(void) data;
+	updateStartIconViewLayout(widget, allocation->width);
+}
+
+static void startIconHostSizeAllocateEvent(GtkWidget *widget,
+		GtkAllocation *allocation, gpointer data) {
+	GtkWidget *icon_view;
+	GtkAdjustment *hadj, *vadj;
+	(void) widget;
+	icon_view = GTK_WIDGET(data);
+	hadj = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(widget));
+	vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(widget));
+	if (hadj != NULL)
+		gtk_adjustment_set_value(hadj, gtk_adjustment_get_lower(hadj));
+	if (vadj != NULL)
+		gtk_adjustment_set_value(vadj, gtk_adjustment_get_lower(vadj));
+	updateStartIconViewLayout(icon_view, allocation->width);
+	gtk_widget_queue_draw(widget);
+	gtk_widget_queue_draw(icon_view);
+}
+
+enum StartIconColumns {
+	START_ICON_COL_PIXBUF = 0, START_ICON_COL_NAME, START_ICON_COL_PATH,
+	START_ICON_COL_TOOLTIP, START_ICON_COL_COUNT
+};
+
+static void startIconItemActivated(GtkIconView *icon_view, GtkTreePath *path,
+		gpointer data) {
+	GtkTreeModel *model;
+	GtkTreeIter iter;
+	gchar *full_path;
+	(void) data;
+
+	model = gtk_icon_view_get_model(icon_view);
+	if (model == NULL || !gtk_tree_model_get_iter(model, &iter, path))
+		return;
+
+	gtk_tree_model_get(model, &iter, START_ICON_COL_PATH, &full_path, -1);
+	openRecentPath(full_path);
+	g_free(full_path);
+}
+
+static void showStartPageIfNeeded(void) {
+	GtkWidget *outer, *scrolled, *icon_view, *parent;
+	GtkListStore *store;
+	GtkIconTheme *theme;
+	gint i;
+
+	if (mainnotebook == NULL)
+		return;
+	if (countDataTabs() > 0) {
+		hideStartPage();
+		gtk_widget_show(mainnotebook);
+		return;
+	}
+	hideStartPage();
+	parent = gtk_widget_get_parent(mainnotebook);
+	if (parent == NULL)
+		return;
+
+	outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	gtk_container_set_border_width(GTK_CONTAINER(outer), 0);
+	gtk_widget_set_hexpand(outer, TRUE);
+	gtk_widget_set_vexpand(outer, TRUE);
+	gtk_widget_set_halign(outer, GTK_ALIGN_FILL);
+	gtk_widget_set_valign(outer, GTK_ALIGN_FILL);
+
+	scrolled = gtk_scrolled_window_new(NULL, NULL);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+			GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+	gtk_widget_set_hexpand(scrolled, TRUE);
+	gtk_widget_set_vexpand(scrolled, TRUE);
+	gtk_widget_set_halign(scrolled, GTK_ALIGN_FILL);
+	gtk_widget_set_valign(scrolled, GTK_ALIGN_FILL);
+	gtk_box_pack_start(GTK_BOX(outer), scrolled, TRUE, TRUE, 0);
+
+	store = gtk_list_store_new(START_ICON_COL_COUNT, GDK_TYPE_PIXBUF, G_TYPE_STRING,
+			G_TYPE_STRING, G_TYPE_STRING);
+	theme = gtk_icon_theme_get_default();
+
+	for (i = 0; recent_files != NULL && i < (gint) recent_files->len; i++) {
+		struct RecentFileEntry *entry;
+		GdkPixbuf *pixbuf;
+		GtkTreeIter iter;
+		gchar *base;
+		GError *pix_err;
+
+		entry = (struct RecentFileEntry *) g_ptr_array_index(recent_files, i);
+		pix_err = NULL;
+		pixbuf = gdk_pixbuf_new_from_file_at_scale(entry->path, START_TILE_THUMB_W,
+				START_TILE_THUMB_H, TRUE, &pix_err);
+		if (pixbuf == NULL) {
+			if (pix_err != NULL)
+				g_error_free(pix_err);
+			pixbuf = gtk_icon_theme_load_icon(theme, "image-missing", 64, 0, NULL);
+		}
+
+		base = g_path_get_basename(entry->path);
+		gtk_list_store_append(store, &iter);
+		gtk_list_store_set(store, &iter, START_ICON_COL_PIXBUF, pixbuf,
+				START_ICON_COL_NAME, base, START_ICON_COL_PATH, entry->path,
+				START_ICON_COL_TOOLTIP, entry->path, -1);
+		if (pixbuf != NULL)
+			g_object_unref(pixbuf);
+		g_free(base);
+	}
+
+	icon_view = gtk_icon_view_new_with_model(GTK_TREE_MODEL(store));
+	gtk_icon_view_set_pixbuf_column(GTK_ICON_VIEW(icon_view), START_ICON_COL_PIXBUF);
+	gtk_icon_view_set_text_column(GTK_ICON_VIEW(icon_view), START_ICON_COL_NAME);
+	gtk_icon_view_set_tooltip_column(GTK_ICON_VIEW(icon_view),
+			START_ICON_COL_TOOLTIP);
+	gtk_icon_view_set_activate_on_single_click(GTK_ICON_VIEW(icon_view), TRUE);
+	gtk_icon_view_set_columns(GTK_ICON_VIEW(icon_view), START_TILE_COLUMNS);
+	gtk_icon_view_set_margin(GTK_ICON_VIEW(icon_view), 6);
+	gtk_icon_view_set_row_spacing(GTK_ICON_VIEW(icon_view), 10);
+	gtk_icon_view_set_column_spacing(GTK_ICON_VIEW(icon_view), 10);
+	gtk_widget_set_hexpand(icon_view, TRUE);
+	gtk_widget_set_vexpand(icon_view, TRUE);
+	gtk_widget_set_halign(icon_view, GTK_ALIGN_FILL);
+	gtk_widget_set_valign(icon_view, GTK_ALIGN_START);
+	g_signal_connect(G_OBJECT(icon_view), "size-allocate",
+			G_CALLBACK(startIconViewSizeAllocateEvent), NULL);
+	g_signal_connect(G_OBJECT(scrolled), "size-allocate",
+			G_CALLBACK(startIconHostSizeAllocateEvent), icon_view);
+	g_signal_connect(G_OBJECT(icon_view), "item-activated",
+			G_CALLBACK(startIconItemActivated), NULL);
+	g_object_unref(store);
+
+	gtk_container_add(GTK_CONTAINER(scrolled), icon_view);
+
+	if (recent_files == NULL || recent_files->len == 0)
+		gtk_widget_set_sensitive(icon_view, FALSE);
+
+	start_page_widget = outer;
+	start_icon_view_widget = icon_view;
+	gtk_box_pack_start(GTK_BOX(parent), start_page_widget, TRUE, TRUE, 0);
+	gtk_widget_show_all(start_page_widget);
+	gtk_widget_hide(mainnotebook);
+	gtk_widget_set_sensitive(close_menu_item, FALSE);
+	gtk_window_set_title(GTK_WINDOW(window), Window_Title_NoneOpen);
+}
+
+static gint windowConfigureEvent(GtkWidget *widget, GdkEvent *event, gpointer data) {
+	gint host_w;
+	(void) widget;
+	(void) event;
+	(void) data;
+
+	if (countDataTabs() == 0)
+		showStartPageIfNeeded();
+
+	if (start_page_widget == NULL || start_icon_view_widget == NULL)
+		return FALSE;
+
+	/* Keep notebook hidden whenever the standalone start page is active. */
+	gtk_widget_hide(mainnotebook);
+	gtk_widget_show_all(start_page_widget);
+
+	host_w = gtk_widget_get_allocated_width(start_page_widget);
+	updateStartIconViewLayout(start_icon_view_widget, host_w);
+	gtk_widget_queue_draw(start_page_widget);
+	gtk_widget_queue_draw(start_icon_view_widget);
+	return FALSE;
+}
+
 static void saveRecentFiles(void) {
 	GKeyFile *kf;
 	gchar *path, *dirpath;
@@ -238,8 +477,7 @@ void recentFileActivate(GtkWidget *widget, gpointer data) {
 	const gchar *path;
 	(void) data;
 	path = (const gchar *) g_object_get_data(G_OBJECT(widget), "recent-path");
-	if (path != NULL)
-		setupNewTab((char *) path, 1.0, -1, -1, FALSE, NULL, NULL, NULL);
+	openRecentPath(path);
 }
 
 static void rebuildRecentFileMenu(void) {
@@ -261,6 +499,7 @@ static void rebuildRecentFileMenu(void) {
 		gtk_menu_shell_insert(GTK_MENU_SHELL(file_menu_widget), empty_item,
 				insert_at);
 		g_ptr_array_add(recent_menu_items, empty_item);
+		showStartPageIfNeeded();
 		return;
 	}
 
@@ -284,6 +523,7 @@ static void rebuildRecentFileMenu(void) {
 		g_free(label);
 		g_free(base);
 	}
+	showStartPageIfNeeded();
 }
 
 static void loadRecentFiles(void) {
@@ -501,6 +741,8 @@ static void setMainImageZoom(struct TabData *tabData, gdouble newZoom,
 	newWidth = (gint) newCanvasW;
 	newHeight = (gint) newCanvasH;
 	gtk_widget_set_size_request(tabData->drawing_area, newWidth, newHeight);
+	gtk_widget_queue_resize(tabData->drawing_area);
+	gtk_widget_queue_resize(tabData->ViewPort);
 	gtk_widget_queue_draw(tabData->drawing_area);
 
 	hNewValue = hImgFocus * newZoom + newOriginX - focusX;
@@ -581,41 +823,47 @@ static void centerImageInView(struct TabData *tabData) {
 	debugDumpViewportState("centerImageInView:end", tabData);
 }
 
-static gboolean applyDeferredRecenter(gpointer data) {
-	struct TabData *tabData;
+static void maybeApplyPendingRecenter(struct TabData *tabData) {
 	GtkAdjustment *hadj, *vadj;
 	gdouble hUpper, vUpper;
-	tabData = (struct TabData *) data;
-	if (tabData == NULL || tabData->ViewPort == NULL)
-		return G_SOURCE_REMOVE;
+
+	if (tabData == NULL || !tabData->pendingRecenterOnAdjust
+			|| tabData->ViewPort == NULL)
+		return;
+
 	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
 	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
 	hUpper = gtk_adjustment_get_upper(hadj);
 	vUpper = gtk_adjustment_get_upper(vadj);
 
-	if ((fabs(hUpper - tabData->viewCanvasSize[0]) > 1.0
-			|| fabs(vUpper - tabData->viewCanvasSize[1]) > 1.0)
-			&& tabData->deferredRecenterRetries > 0) {
-		tabData->deferredRecenterRetries--;
+	if (hUpper + 1.0 < tabData->viewCanvasSize[0]
+			|| vUpper + 1.0 < tabData->viewCanvasSize[1]) {
 		G3DBG(
-				"applyDeferredRecenter: waiting for bounds sync upper=(%.2f,%.2f) canvas=(%.2f,%.2f) retries=%d\n",
-				hUpper, vUpper, tabData->viewCanvasSize[0], tabData->viewCanvasSize[1],
-				tabData->deferredRecenterRetries);
-		return G_SOURCE_CONTINUE;
+				"maybeApplyPendingRecenter: waiting (bounds too small) upper=(%.2f,%.2f) canvas=(%.2f,%.2f)\n",
+				hUpper, vUpper, tabData->viewCanvasSize[0], tabData->viewCanvasSize[1]);
+		return;
 	}
 
-	debugDumpViewportState("applyDeferredRecenter:begin", tabData);
+	debugDumpViewportState("maybeApplyPendingRecenter:begin", tabData);
 	centerImageInView(tabData);
-	debugDumpViewportState("applyDeferredRecenter:end", tabData);
-	return G_SOURCE_REMOVE;
+	tabData->pendingRecenterOnAdjust = FALSE;
+	debugDumpViewportState("maybeApplyPendingRecenter:end", tabData);
+}
+
+static void adjustmentChangedEvent(GtkAdjustment *adjustment, gpointer data) {
+	struct TabData *tabData;
+	(void) adjustment;
+
+	tabData = (struct TabData *) data;
+	debugDumpViewportState("adjustmentChangedEvent", tabData);
+	maybeApplyPendingRecenter(tabData);
 }
 
 static void zoomToFitAndCenter(struct TabData *tabData) {
 	debugDumpViewportState("zoomToFitAndCenter:begin", tabData);
 	setMainImageZoom(tabData, calculateZoomToFit(tabData), -1.0, -1.0);
-	centerImageInView(tabData);
-	tabData->deferredRecenterRetries = 15;
-	g_timeout_add(20, applyDeferredRecenter, tabData);
+	tabData->pendingRecenterOnAdjust = TRUE;
+	maybeApplyPendingRecenter(tabData);
 	debugDumpViewportState("zoomToFitAndCenter:end", tabData);
 }
 
@@ -650,6 +898,7 @@ static void viewportSizeAllocateEvent(GtkWidget *widget, GtkAllocation *allocati
 	G3DBG("viewportSizeAllocateEvent: alloc=%dx%d\n", allocation->width,
 			allocation->height);
 	maybeApplyInitialZoomToFit((struct TabData *) data);
+	maybeApplyPendingRecenter((struct TabData *) data);
 }
 
 static void getImageCoords(struct TabData *tabData, gdouble widgetX,
@@ -1489,6 +1738,8 @@ gint keyPressEvent(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 						G_OBJECT(gtk_notebook_get_nth_page((GtkNotebook *) mainnotebook,
 										gtk_notebook_get_current_page((GtkNotebook *) mainnotebook))),
 						DATA_STORE_NAME);
+		if (tabData == NULL)
+			return 0;
 
 		if (event->keyval == GDK_KEY_Left) {
 			adjustment = gtk_scrollable_get_hadjustment(
@@ -1570,6 +1821,8 @@ gint keyReleaseEvent(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 						G_OBJECT(gtk_notebook_get_nth_page((GtkNotebook *) mainnotebook,
 										gtk_notebook_get_current_page((GtkNotebook *) mainnotebook))),
 						DATA_STORE_NAME);
+		if (tabData == NULL)
+			return 0;
 
 		if (event->keyval == GDK_KEY_Control_L) {
 			display = gtk_widget_get_display(tabData->drawing_area);
@@ -1769,6 +2022,8 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 
 	struct TabData *tabData;
 
+	hideStartPage();
+
 	if ((tabData = allocateTabMemory()) == NULL) {
 		dialog = gtk_message_dialog_new(GTK_WINDOW(window), /* Notify user of the error */
 		GTK_DIALOG_DESTROY_WITH_PARENT, /* with a dialog */
@@ -1859,7 +2114,7 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	tabData->middlePanning = FALSE;
 	tabData->middlePanMoved = FALSE;
 	tabData->pendingInitialZoomToFit = FALSE;
-	tabData->deferredRecenterRetries = 0;
+	tabData->pendingRecenterOnAdjust = FALSE;
 
 	for (i = 0; i < 4; i++) {
 		tabData->xyentry[i] = gtk_entry_new(); /* Create text entry */
@@ -2172,6 +2427,12 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	tabData->ViewPort = gtk_viewport_new(NULL, NULL);
 	g_signal_connect(G_OBJECT(tabData->ViewPort), "size-allocate",
 			G_CALLBACK(viewportSizeAllocateEvent), tabData);
+	g_signal_connect(
+			G_OBJECT(gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort))),
+			"changed", G_CALLBACK(adjustmentChangedEvent), tabData);
+	g_signal_connect(
+			G_OBJECT(gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort))),
+			"changed", G_CALLBACK(adjustmentChangedEvent), tabData);
 
 	gtk_box_pack_start(GTK_BOX (brvbox), ScrollWindow, TRUE, TRUE, 0);
 	drawing_area_alignment = g3AlignmentNew(0, 0, 0, 0);
@@ -2386,11 +2647,24 @@ GCallback menuHelpAbout(void) {
 GCallback menuTabClose(void) {
 	gint i;
 	gint page_num = gtk_notebook_get_current_page((GtkNotebook *) mainnotebook);
+	GtkWidget *page;
 
 	struct TabData *tabData;
+	if (page_num < 0) {
+		showStartPageIfNeeded();
+		return NULL;
+	}
+	page = gtk_notebook_get_nth_page((GtkNotebook *) mainnotebook, page_num);
+	if (page == NULL) {
+		showStartPageIfNeeded();
+		return NULL;
+	}
 	tabData = (struct TabData *) g_object_get_data(
-			G_OBJECT(gtk_notebook_get_nth_page((GtkNotebook *) mainnotebook,
-							page_num)), DATA_STORE_NAME);
+			G_OBJECT(page), DATA_STORE_NAME);
+	if (tabData == NULL) {
+		showStartPageIfNeeded();
+		return NULL;
+	}
 
 	gtk_notebook_remove_page((GtkNotebook *) mainnotebook, page_num); /* This appearently takes care of everything */
 
@@ -2405,8 +2679,9 @@ GCallback menuTabClose(void) {
 	}
 	free(tabData);
 
-	if (gtk_notebook_get_n_pages((GtkNotebook *) mainnotebook) == 0)
+	if (countDataTabs() == 0)
 		gtk_widget_set_sensitive(close_menu_item, FALSE);
+	showStartPageIfNeeded();
 
 	return NULL;
 }
@@ -2476,6 +2751,8 @@ GCallback hideZoomArea(GtkWidget *widget, gpointer func_data) {
 		tabData = (struct TabData *) g_object_get_data(
 				G_OBJECT(gtk_notebook_get_nth_page((GtkNotebook *) mainnotebook,
 								i)), DATA_STORE_NAME);
+		if (tabData == NULL)
+			continue;
 		if (gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(widget))) {
 			gtk_widget_hide(tabData->zoomareabox);
 		} else {
@@ -2499,6 +2776,8 @@ GCallback hideAxisSettings(GtkWidget *widget, gpointer func_data) {
 		tabData = (struct TabData *) g_object_get_data(
 				G_OBJECT(gtk_notebook_get_nth_page((GtkNotebook *) mainnotebook,
 								i)), DATA_STORE_NAME);
+		if (tabData == NULL)
+			continue;
 		if (gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(widget))) {
 			gtk_widget_hide(tabData->logbox);
 		} else {
@@ -2522,6 +2801,8 @@ GCallback hideOutputProperties(GtkWidget *widget, gpointer func_data) {
 		tabData = (struct TabData *) g_object_get_data(
 				G_OBJECT(gtk_notebook_get_nth_page((GtkNotebook *) mainnotebook,
 								i)), DATA_STORE_NAME);
+		if (tabData == NULL)
+			continue;
 		if (gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(widget))) {
 			gtk_widget_hide(tabData->oppropbox);
 		} else {
@@ -2549,6 +2830,8 @@ GCallback notebookTabSwitchEventHandler(GtkNotebook *notebook, GtkWidget *page,
 	if (tabData != NULL) {
 		sprintf(buf, Window_Title, tabData->FileNames); /* Print window title in buffer */
 		gtk_window_set_title(GTK_WINDOW (window), buf); /* Set window title */
+	} else {
+		gtk_window_set_title(GTK_WINDOW(window), Window_Title_NoneOpen);
 	}
 	return NULL;
 }
@@ -2681,6 +2964,8 @@ int main(int argc, char **argv) {
 
 	g_signal_connect(G_OBJECT (window), "delete_event", /* Init delete event of window */
 	G_CALLBACK (closeApplicationHandler), NULL);
+	g_signal_connect(G_OBJECT(window), "configure-event",
+			G_CALLBACK(windowConfigureEvent), NULL);
 
 	gtk_drag_dest_set(window, GTK_DEST_DEFAULT_ALL, ui_drop_target_entries,
 			DROP_TARGET_NUM_DEFS, (GDK_ACTION_COPY | GDK_ACTION_MOVE));
@@ -2781,7 +3066,7 @@ int main(int argc, char **argv) {
 	gtk_widget_add_accelerator(open_item, "activate", accel_group, GDK_KEY_O,
 			GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
 	gtk_widget_add_accelerator(close_menu_item, "activate", accel_group,
-			GDK_KEY_C, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
+			GDK_KEY_W, GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
 	gtk_widget_add_accelerator(quit_item, "activate", accel_group, GDK_KEY_Q,
 			GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
 	gtk_widget_add_accelerator(about_item, "activate", accel_group, GDK_KEY_H,
@@ -2820,8 +3105,10 @@ int main(int argc, char **argv) {
 		setupNewTab(argv[FileIndex[i]], Scale, maxX, maxY, UsePreSetCoords,
 				TempCoordsPtr, &(Uselogxy[0]), &UseError);
 	}
+	showStartPageIfNeeded();
 
 	gtk_widget_show_all(window); /* Show all widgets */
+	showStartPageIfNeeded();
 
 	gtk_main(); /* This is where it all starts */
 

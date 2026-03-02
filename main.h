@@ -107,7 +107,6 @@ struct TabData {
 	gdouble middlePanStartAdj[2];
 	gboolean pendingInitialZoomToFit;
 	gboolean pendingRecenterOnAdjust;
-	gint deferredRecenterRetries;
 };
 
 struct ButtonData {
