@@ -29,6 +29,7 @@
 #include <stdlib.h>									/* Include stdlib library */
 #include <string.h>									/* Include string library */
 #include <math.h>
+#include <glib/gstdio.h>
 #include <libgen.h>
 #include "main.h"									/* Include predefined variables */
 #include "strings.h"								/* Include strings */
@@ -50,16 +51,42 @@
 
 // This is the name we will attach the data structure to the container with
 static const char *DATA_STORE_NAME = "tabdatastruct";
-static const gdouble MAIN_IMAGE_MIN_ZOOM = 1.0;
+static const gdouble MAIN_IMAGE_MIN_ZOOM = 0.05;
 static const gdouble MAIN_IMAGE_MAX_ZOOM = 8.0;
 static const gdouble MAIN_IMAGE_ZOOM_STEP = 1.25;
+static const gdouble MAIN_IMAGE_CANVAS_MIN_PAD = 512.0;
+static const gint MAX_RECENT_FILES = 5;
+static const char *RECENT_GROUP = "RecentFiles";
+static const char *RECENT_PATH_KEY_FMT = "path_%d";
+static const char *RECENT_DATE_KEY_FMT = "date_%d";
 
 static const char *DROPPED_URI_DELIMITER = "\r\n";
+
+#ifdef G3DATA2_DEBUG
+#define G3DBG(...) g_printerr("[g3data2][debug] " __VA_ARGS__)
+#else
+#define G3DBG(...) ((void) 0)
+#endif
+
+static void setButtonSensitivity(struct TabData *tabData);
+static void triggerUpdateDrawArea(GtkWidget *area);
+gint setupNewTab(char *filename, gdouble Scale, gdouble maxX,
+		gdouble maxY, gboolean UsePreSetCoords, gdouble *TempCoords,
+		gboolean *Uselogxy, gboolean *UseError);
 
 // Declaration of gtk variables
 GtkWidget *window;
 GtkWidget *mainnotebook;
 GtkWidget *close_menu_item;
+GtkWidget *file_menu_widget;
+
+struct RecentFileEntry {
+	gchar *path;
+	gchar *date;
+};
+
+GPtrArray *recent_files;
+GPtrArray *recent_menu_items;
 
 // Declaration of global variables
 gboolean MovePointMode = FALSE;
@@ -71,6 +98,47 @@ extern struct PointValue calculatePointValue(gdouble Xpos, gdouble Ypos,
 		struct TabData *tabData);
 extern void outputResultset(GtkWidget *widget, gpointer func_data);
 
+static void debugDumpViewportState(const char *tag, struct TabData *tabData) {
+#ifdef G3DATA2_DEBUG
+	GtkAdjustment *hadj, *vadj;
+	gdouble hVal, hLower, hUpper, hPage;
+	gdouble vVal, vLower, vUpper, vPage;
+	gint vpW, vpH, daW, daH;
+
+	if (tabData == NULL || tabData->ViewPort == NULL) {
+		G3DBG("%s: tab/viewport not ready\n", tag);
+		return;
+	}
+
+	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	hVal = gtk_adjustment_get_value(hadj);
+	hLower = gtk_adjustment_get_lower(hadj);
+	hUpper = gtk_adjustment_get_upper(hadj);
+	hPage = gtk_adjustment_get_page_size(hadj);
+	vVal = gtk_adjustment_get_value(vadj);
+	vLower = gtk_adjustment_get_lower(vadj);
+	vUpper = gtk_adjustment_get_upper(vadj);
+	vPage = gtk_adjustment_get_page_size(vadj);
+	vpW = gtk_widget_get_allocated_width(tabData->ViewPort);
+	vpH = gtk_widget_get_allocated_height(tabData->ViewPort);
+	daW = tabData->drawing_area != NULL ?
+			gtk_widget_get_allocated_width(tabData->drawing_area) : -1;
+	daH = tabData->drawing_area != NULL ?
+			gtk_widget_get_allocated_height(tabData->drawing_area) : -1;
+
+	G3DBG(
+			"%s: vp_alloc=%dx%d da_alloc=%dx%d hadj[v=%.2f lo=%.2f up=%.2f page=%.2f] vadj[v=%.2f lo=%.2f up=%.2f page=%.2f] zoom=%.6f origin=(%.2f,%.2f) canvas=(%.2f,%.2f) image=%dx%d pending_fit=%d\n",
+			tag, vpW, vpH, daW, daH, hVal, hLower, hUpper, hPage, vVal, vLower, vUpper,
+			vPage, tabData->viewZoom, tabData->viewOrigin[0], tabData->viewOrigin[1],
+			tabData->viewCanvasSize[0], tabData->viewCanvasSize[1], tabData->XSize,
+			tabData->YSize, tabData->pendingInitialZoomToFit);
+#else
+	(void) tag;
+	(void) tabData;
+#endif
+}
+
 /****************************************************************/
 /* This function closes the window when the application is 	*/
 /* killed.							*/
@@ -78,6 +146,227 @@ extern void outputResultset(GtkWidget *widget, gpointer func_data);
 gint closeApplicationHandler(GtkWidget *widget, GdkEvent *event, gpointer data) {
 	gtk_main_quit(); /* Quit gtk */
 	return FALSE;
+}
+
+static void freeRecentFileEntry(gpointer data) {
+	struct RecentFileEntry *entry;
+	entry = (struct RecentFileEntry *) data;
+	if (entry == NULL)
+		return;
+	g_free(entry->path);
+	g_free(entry->date);
+	g_free(entry);
+}
+
+static gchar *getRecentFilesPath(void) {
+	return g_build_filename(g_get_user_config_dir(), "g3data3",
+			"recent-files.ini", NULL);
+}
+
+static gchar *getNowIsoTimestamp(void) {
+	GDateTime *dt;
+	gchar *stamp;
+	dt = g_date_time_new_now_local();
+	stamp = g_date_time_format(dt, "%Y-%m-%dT%H:%M:%S%z");
+	g_date_time_unref(dt);
+	return stamp;
+}
+
+static gint getMenuItemIndex(GtkWidget *menu, GtkWidget *item) {
+	GList *children, *iter;
+	gint idx;
+
+	children = gtk_container_get_children(GTK_CONTAINER(menu));
+	idx = 0;
+	for (iter = children; iter != NULL; iter = iter->next, idx++) {
+		if (iter->data == item) {
+			g_list_free(children);
+			return idx;
+		}
+	}
+	g_list_free(children);
+	return -1;
+}
+
+static void clearRecentFileMenuItems(void) {
+	guint i;
+
+	if (recent_menu_items == NULL || file_menu_widget == NULL)
+		return;
+	for (i = 0; i < recent_menu_items->len; i++) {
+		GtkWidget *item;
+		item = (GtkWidget *) g_ptr_array_index(recent_menu_items, i);
+		gtk_container_remove(GTK_CONTAINER(file_menu_widget), item);
+	}
+	g_ptr_array_set_size(recent_menu_items, 0);
+}
+
+static void saveRecentFiles(void) {
+	GKeyFile *kf;
+	gchar *path, *dirpath;
+	gchar *out;
+	gsize out_len;
+	guint i;
+	gchar keybuf[32];
+
+	if (recent_files == NULL)
+		return;
+
+	kf = g_key_file_new();
+	for (i = 0; i < recent_files->len && i < (guint) MAX_RECENT_FILES; i++) {
+		struct RecentFileEntry *entry;
+		entry = (struct RecentFileEntry *) g_ptr_array_index(recent_files, i);
+		snprintf(keybuf, sizeof(keybuf), RECENT_PATH_KEY_FMT, (int) i);
+		g_key_file_set_string(kf, RECENT_GROUP, keybuf, entry->path);
+		snprintf(keybuf, sizeof(keybuf), RECENT_DATE_KEY_FMT, (int) i);
+		g_key_file_set_string(kf, RECENT_GROUP, keybuf, entry->date);
+	}
+
+	out = g_key_file_to_data(kf, &out_len, NULL);
+	path = getRecentFilesPath();
+	dirpath = g_path_get_dirname(path);
+	g_mkdir_with_parents(dirpath, 0755);
+	g_file_set_contents(path, out, out_len, NULL);
+
+	g_free(dirpath);
+	g_free(path);
+	g_free(out);
+	g_key_file_unref(kf);
+}
+
+void recentFileActivate(GtkWidget *widget, gpointer data) {
+	const gchar *path;
+	(void) data;
+	path = (const gchar *) g_object_get_data(G_OBJECT(widget), "recent-path");
+	if (path != NULL)
+		setupNewTab((char *) path, 1.0, -1, -1, FALSE, NULL, NULL, NULL);
+}
+
+static void rebuildRecentFileMenu(void) {
+	gint insert_at;
+	guint i;
+
+	if (file_menu_widget == NULL || close_menu_item == NULL || recent_files == NULL)
+		return;
+
+	clearRecentFileMenuItems();
+	insert_at = getMenuItemIndex(file_menu_widget, close_menu_item);
+	if (insert_at < 0)
+		return;
+
+	if (recent_files->len == 0) {
+		GtkWidget *empty_item;
+		empty_item = gtk_menu_item_new_with_label("(No recent files)");
+		gtk_widget_set_sensitive(empty_item, FALSE);
+		gtk_menu_shell_insert(GTK_MENU_SHELL(file_menu_widget), empty_item,
+				insert_at);
+		g_ptr_array_add(recent_menu_items, empty_item);
+		return;
+	}
+
+	for (i = 0; i < recent_files->len; i++) {
+		struct RecentFileEntry *entry;
+		GtkWidget *item;
+		gchar *base;
+		gchar *label;
+
+		entry = (struct RecentFileEntry *) g_ptr_array_index(recent_files, i);
+		base = g_path_get_basename(entry->path);
+		label = g_strdup_printf("%s  (%s)", base, entry->date);
+		item = gtk_menu_item_new_with_label(label);
+		g_object_set_data_full(G_OBJECT(item), "recent-path",
+				g_strdup(entry->path), g_free);
+		gtk_widget_set_tooltip_text(item, entry->path);
+		g_signal_connect(G_OBJECT(item), "activate",
+				G_CALLBACK(recentFileActivate), NULL);
+		gtk_menu_shell_insert(GTK_MENU_SHELL(file_menu_widget), item, insert_at + i);
+		g_ptr_array_add(recent_menu_items, item);
+		g_free(label);
+		g_free(base);
+	}
+}
+
+static void loadRecentFiles(void) {
+	GKeyFile *kf;
+	gchar *path;
+	guint i;
+	gchar keybuf[32];
+	GError *err;
+
+	if (recent_files == NULL)
+		recent_files = g_ptr_array_new_with_free_func(freeRecentFileEntry);
+	else
+		g_ptr_array_set_size(recent_files, 0);
+
+	kf = g_key_file_new();
+	path = getRecentFilesPath();
+	err = NULL;
+	if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, &err)) {
+		if (err != NULL)
+			g_error_free(err);
+		g_free(path);
+		g_key_file_unref(kf);
+		return;
+	}
+
+	for (i = 0; i < (guint) MAX_RECENT_FILES; i++) {
+		gchar *p, *d;
+		struct RecentFileEntry *entry;
+
+		snprintf(keybuf, sizeof(keybuf), RECENT_PATH_KEY_FMT, (int) i);
+		p = g_key_file_get_string(kf, RECENT_GROUP, keybuf, NULL);
+		if (p == NULL || *p == '\0') {
+			g_free(p);
+			continue;
+		}
+		snprintf(keybuf, sizeof(keybuf), RECENT_DATE_KEY_FMT, (int) i);
+		d = g_key_file_get_string(kf, RECENT_GROUP, keybuf, NULL);
+		if (d == NULL || *d == '\0') {
+			g_free(d);
+			d = g_strdup("");
+		}
+		entry = g_new0(struct RecentFileEntry, 1);
+		entry->path = p;
+		entry->date = d;
+		g_ptr_array_add(recent_files, entry);
+	}
+
+	g_free(path);
+	g_key_file_unref(kf);
+}
+
+static void addRecentFile(const gchar *filename) {
+	gchar *canon;
+	gchar *now;
+	guint i;
+	struct RecentFileEntry *entry;
+
+	if (filename == NULL || *filename == '\0')
+		return;
+	if (recent_files == NULL)
+		recent_files = g_ptr_array_new_with_free_func(freeRecentFileEntry);
+
+	canon = g_canonicalize_filename(filename, NULL);
+	for (i = 0; i < recent_files->len; i++) {
+		struct RecentFileEntry *cur;
+		cur = (struct RecentFileEntry *) g_ptr_array_index(recent_files, i);
+		if (g_strcmp0(cur->path, canon) == 0) {
+			g_ptr_array_remove_index(recent_files, i);
+			break;
+		}
+	}
+
+	now = getNowIsoTimestamp();
+	entry = g_new0(struct RecentFileEntry, 1);
+	entry->path = canon;
+	entry->date = now;
+	g_ptr_array_insert(recent_files, 0, entry);
+
+	while (recent_files->len > (guint) MAX_RECENT_FILES)
+		g_ptr_array_remove_index(recent_files, recent_files->len - 1);
+
+	saveRecentFiles();
+	rebuildRecentFileMenu();
 }
 
 gboolean updateZoomArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
@@ -125,69 +414,250 @@ static gdouble clampZoom(gdouble zoom) {
 	return zoom;
 }
 
+static gdouble getAdjustmentUpperBound(GtkAdjustment *adjustment) {
+	gdouble lower, upper;
+	lower = gtk_adjustment_get_lower(adjustment);
+	upper = gtk_adjustment_get_upper(adjustment)
+			- gtk_adjustment_get_page_size(adjustment);
+	if (upper < lower)
+		upper = lower;
+	return upper;
+}
+
+static void getViewportSize(struct TabData *tabData, gdouble *pageW, gdouble *pageH) {
+	GtkAdjustment *hadj, *vadj;
+	gdouble allocW, allocH, pageAdjW, pageAdjH;
+
+	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	allocW = gtk_widget_get_allocated_width(tabData->ViewPort);
+	allocH = gtk_widget_get_allocated_height(tabData->ViewPort);
+	pageAdjW = gtk_adjustment_get_page_size(hadj);
+	pageAdjH = gtk_adjustment_get_page_size(vadj);
+
+	if (allocW > 1.0 && pageAdjW > 1.0)
+		*pageW = MIN(allocW, pageAdjW);
+	else if (allocW > 1.0)
+		*pageW = allocW;
+	else
+		*pageW = pageAdjW;
+
+	if (allocH > 1.0 && pageAdjH > 1.0)
+		*pageH = MIN(allocH, pageAdjH);
+	else if (allocH > 1.0)
+		*pageH = allocH;
+	else
+		*pageH = pageAdjH;
+}
+
 static void setMainImageZoom(struct TabData *tabData, gdouble newZoom,
 		gdouble focusX, gdouble focusY) {
 	GtkAdjustment *hadj, *vadj;
 	gdouble oldZoom;
+	gdouble oldOriginX, oldOriginY;
 	gdouble hvalue, vvalue;
 	gdouble hImgFocus, vImgFocus;
 	gdouble hNewValue, vNewValue;
 	gdouble pageW, pageH;
+	gdouble newOriginX, newOriginY;
+	gdouble hLower, vLower, hMax, vMax;
+	gdouble newImageW, newImageH;
+	gdouble newCanvasW, newCanvasH;
 	gint newWidth, newHeight;
 
 	newZoom = clampZoom(newZoom);
 	oldZoom = tabData->viewZoom;
-	if (oldZoom == newZoom)
-		return;
+	oldOriginX = tabData->viewOrigin[0];
+	oldOriginY = tabData->viewOrigin[1];
+	debugDumpViewportState("setMainImageZoom:begin", tabData);
 
 	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
 	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
 	hvalue = gtk_adjustment_get_value(hadj);
 	vvalue = gtk_adjustment_get_value(vadj);
-	pageW = gtk_adjustment_get_page_size(hadj);
-	pageH = gtk_adjustment_get_page_size(vadj);
+	getViewportSize(tabData, &pageW, &pageH);
 
 	if (focusX < 0)
 		focusX = pageW / 2.0;
 	if (focusY < 0)
 		focusY = pageH / 2.0;
 
-	hImgFocus = (hvalue + focusX) / oldZoom;
-	vImgFocus = (vvalue + focusY) / oldZoom;
+	hImgFocus = (hvalue + focusX - oldOriginX) / oldZoom;
+	vImgFocus = (vvalue + focusY - oldOriginY) / oldZoom;
 
 	tabData->viewZoom = newZoom;
-	newWidth = (gint) (tabData->XSize * tabData->viewZoom);
-	newHeight = (gint) (tabData->YSize * tabData->viewZoom);
+	newImageW = tabData->XSize * tabData->viewZoom;
+	newImageH = tabData->YSize * tabData->viewZoom;
+	newOriginX = MAIN_IMAGE_CANVAS_MIN_PAD;
+	newOriginY = MAIN_IMAGE_CANVAS_MIN_PAD;
+	newCanvasW = newImageW + 2.0 * newOriginX;
+	newCanvasH = newImageH + 2.0 * newOriginY;
+
+	tabData->viewOrigin[0] = newOriginX;
+	tabData->viewOrigin[1] = newOriginY;
+	tabData->viewCanvasSize[0] = newCanvasW;
+	tabData->viewCanvasSize[1] = newCanvasH;
+
+	newWidth = (gint) newCanvasW;
+	newHeight = (gint) newCanvasH;
 	gtk_widget_set_size_request(tabData->drawing_area, newWidth, newHeight);
 	gtk_widget_queue_draw(tabData->drawing_area);
 
-	hNewValue = hImgFocus * newZoom - focusX;
-	vNewValue = vImgFocus * newZoom - focusY;
+	hNewValue = hImgFocus * newZoom + newOriginX - focusX;
+	vNewValue = vImgFocus * newZoom + newOriginY - focusY;
+	hLower = gtk_adjustment_get_lower(hadj);
+	vLower = gtk_adjustment_get_lower(vadj);
+	hMax = hLower + MAX(newCanvasW - pageW, 0.0);
+	vMax = vLower + MAX(newCanvasH - pageH, 0.0);
 
-	if (hNewValue < gtk_adjustment_get_lower(hadj))
-		hNewValue = gtk_adjustment_get_lower(hadj);
-	if (hNewValue
-			> gtk_adjustment_get_upper(hadj) - gtk_adjustment_get_page_size(hadj))
-		hNewValue = gtk_adjustment_get_upper(hadj)
-				- gtk_adjustment_get_page_size(hadj);
+	if (hNewValue < hLower)
+		hNewValue = hLower;
+	if (hNewValue > hMax)
+		hNewValue = hMax;
 
-	if (vNewValue < gtk_adjustment_get_lower(vadj))
-		vNewValue = gtk_adjustment_get_lower(vadj);
-	if (vNewValue
-			> gtk_adjustment_get_upper(vadj) - gtk_adjustment_get_page_size(vadj))
-		vNewValue = gtk_adjustment_get_upper(vadj)
-				- gtk_adjustment_get_page_size(vadj);
+	if (vNewValue < vLower)
+		vNewValue = vLower;
+	if (vNewValue > vMax)
+		vNewValue = vMax;
 
 	gtk_adjustment_set_value(hadj, hNewValue);
 	gtk_adjustment_set_value(vadj, vNewValue);
+	G3DBG(
+			"setMainImageZoom:end newZoom=%.6f focus=(%.2f,%.2f) page=(%.2f,%.2f) newOrigin=(%.2f,%.2f) newCanvas=(%.2f,%.2f) newAdj=(%.2f,%.2f)\n",
+			newZoom, focusX, focusY, pageW, pageH, newOriginX, newOriginY, newCanvasW,
+			newCanvasH, hNewValue, vNewValue);
+	debugDumpViewportState("setMainImageZoom:end", tabData);
+}
+
+static gdouble calculateZoomToFit(struct TabData *tabData) {
+	gdouble pageW, pageH;
+	gdouble fitX, fitY;
+
+	getViewportSize(tabData, &pageW, &pageH);
+	if (pageW <= 1.0 || pageH <= 1.0)
+		return 1.0;
+
+	fitX = pageW / tabData->XSize;
+	fitY = pageH / tabData->YSize;
+	return clampZoom(MIN(fitX, fitY));
+}
+
+static void centerImageInView(struct TabData *tabData) {
+	GtkAdjustment *hadj, *vadj;
+	gdouble pageW, pageH;
+	gdouble imageW, imageH;
+	gdouble hLower, vLower, hMax, vMax;
+	gdouble hNew, vNew;
+
+	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	getViewportSize(tabData, &pageW, &pageH);
+
+	imageW = tabData->XSize * tabData->viewZoom;
+	imageH = tabData->YSize * tabData->viewZoom;
+
+	hNew = tabData->viewOrigin[0] + imageW / 2.0 - pageW / 2.0;
+	vNew = tabData->viewOrigin[1] + imageH / 2.0 - pageH / 2.0;
+
+	hLower = gtk_adjustment_get_lower(hadj);
+	vLower = gtk_adjustment_get_lower(vadj);
+	hMax = hLower + MAX(tabData->viewCanvasSize[0] - pageW, 0.0);
+	vMax = vLower + MAX(tabData->viewCanvasSize[1] - pageH, 0.0);
+
+	if (hNew < hLower)
+		hNew = hLower;
+	if (hNew > hMax)
+		hNew = hMax;
+	if (vNew < vLower)
+		vNew = vLower;
+	if (vNew > vMax)
+		vNew = vMax;
+
+	gtk_adjustment_set_value(hadj, hNew);
+	gtk_adjustment_set_value(vadj, vNew);
+	G3DBG(
+			"centerImageInView: page=(%.2f,%.2f) image=(%.2f,%.2f) targetAdj=(%.2f,%.2f)\n",
+			pageW, pageH, imageW, imageH, hNew, vNew);
+	debugDumpViewportState("centerImageInView:end", tabData);
+}
+
+static gboolean applyDeferredRecenter(gpointer data) {
+	struct TabData *tabData;
+	GtkAdjustment *hadj, *vadj;
+	gdouble hUpper, vUpper;
+	tabData = (struct TabData *) data;
+	if (tabData == NULL || tabData->ViewPort == NULL)
+		return G_SOURCE_REMOVE;
+	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	hUpper = gtk_adjustment_get_upper(hadj);
+	vUpper = gtk_adjustment_get_upper(vadj);
+
+	if ((fabs(hUpper - tabData->viewCanvasSize[0]) > 1.0
+			|| fabs(vUpper - tabData->viewCanvasSize[1]) > 1.0)
+			&& tabData->deferredRecenterRetries > 0) {
+		tabData->deferredRecenterRetries--;
+		G3DBG(
+				"applyDeferredRecenter: waiting for bounds sync upper=(%.2f,%.2f) canvas=(%.2f,%.2f) retries=%d\n",
+				hUpper, vUpper, tabData->viewCanvasSize[0], tabData->viewCanvasSize[1],
+				tabData->deferredRecenterRetries);
+		return G_SOURCE_CONTINUE;
+	}
+
+	debugDumpViewportState("applyDeferredRecenter:begin", tabData);
+	centerImageInView(tabData);
+	debugDumpViewportState("applyDeferredRecenter:end", tabData);
+	return G_SOURCE_REMOVE;
+}
+
+static void zoomToFitAndCenter(struct TabData *tabData) {
+	debugDumpViewportState("zoomToFitAndCenter:begin", tabData);
+	setMainImageZoom(tabData, calculateZoomToFit(tabData), -1.0, -1.0);
+	centerImageInView(tabData);
+	tabData->deferredRecenterRetries = 15;
+	g_timeout_add(20, applyDeferredRecenter, tabData);
+	debugDumpViewportState("zoomToFitAndCenter:end", tabData);
+}
+
+static void maybeApplyInitialZoomToFit(struct TabData *tabData) {
+	if (tabData == NULL || !tabData->pendingInitialZoomToFit
+			|| tabData->drawing_area == NULL || tabData->ViewPort == NULL)
+		return;
+	if (tabData->XSize <= 0 || tabData->YSize <= 0)
+		return;
+	if (gtk_widget_get_allocated_width(tabData->ViewPort) <= 1
+			|| gtk_widget_get_allocated_height(tabData->ViewPort) <= 1)
+		return;
+
+	debugDumpViewportState("maybeApplyInitialZoomToFit:ready", tabData);
+	zoomToFitAndCenter(tabData);
+	tabData->pendingInitialZoomToFit = FALSE;
+	debugDumpViewportState("maybeApplyInitialZoomToFit:done", tabData);
+}
+
+static gboolean applyInitialZoomToFit(gpointer data) {
+	struct TabData *tabData;
+
+	tabData = (struct TabData *) data;
+	debugDumpViewportState("applyInitialZoomToFit", tabData);
+	maybeApplyInitialZoomToFit(tabData);
+	return G_SOURCE_REMOVE;
+}
+
+static void viewportSizeAllocateEvent(GtkWidget *widget, GtkAllocation *allocation,
+		gpointer data) {
+	(void) widget;
+	G3DBG("viewportSizeAllocateEvent: alloc=%dx%d\n", allocation->width,
+			allocation->height);
+	maybeApplyInitialZoomToFit((struct TabData *) data);
 }
 
 static void getImageCoords(struct TabData *tabData, gdouble widgetX,
 		gdouble widgetY, gdouble *imageX, gdouble *imageY) {
 	if (tabData->viewZoom <= 0)
 		tabData->viewZoom = 1.0;
-	*imageX = widgetX / tabData->viewZoom;
-	*imageY = widgetY / tabData->viewZoom;
+	*imageX = (widgetX - tabData->viewOrigin[0]) / tabData->viewZoom;
+	*imageY = (widgetY - tabData->viewOrigin[1]) / tabData->viewZoom;
 }
 
 static GtkWidget *g3TableNew(guint rows, guint columns, gboolean homogeneous) {
@@ -253,46 +723,66 @@ static GtkWidget *g3AlignmentNew(gfloat xalign, gfloat yalign, gfloat xscale,
 	return box;
 }
 
+static void applyMiddleButtonAxisShortcut(struct TabData *tabData, gdouble imageX,
+		gdouble imageY) {
+	gint i, j;
+
+	for (i = 0; i < 2; i++) {
+		if (!tabData->bpressed[i]) {
+			tabData->axiscoords[i][0] = imageX;
+			tabData->axiscoords[i][1] = imageY;
+			for (j = 0; j < 4; j++)
+				if (i != j)
+					gtk_widget_set_sensitive(tabData->setxybutton[j], TRUE);
+			gtk_widget_set_sensitive(tabData->xyentry[i], TRUE);
+			gtk_editable_set_editable((GtkEditable *) tabData->xyentry[i], TRUE);
+			gtk_widget_grab_focus(tabData->xyentry[i]);
+			tabData->setxypressed[i] = FALSE;
+			tabData->bpressed[i] = TRUE;
+			gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tabData->setxybutton[i]),
+					FALSE);
+			tabData->lastpoints[tabData->numlastpoints] = -(i + 1);
+			tabData->numlastpoints++;
+			setButtonSensitivity(tabData);
+			triggerUpdateDrawArea(tabData->drawing_area);
+			break;
+		}
+	}
+}
+
 gboolean updateImageArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
-	guint width, height;
 	gint i;
-	cairo_t *first_cr;
-	cairo_surface_t *first;
 	struct TabData *tabData;
 
 	tabData = (struct TabData *) data;
 
-	width = gtk_widget_get_allocated_width(widget);
-	height = gtk_widget_get_allocated_height(widget);
+	(void) widget;
 
-	first = cairo_surface_create_similar(cairo_get_target(cr),
-			CAIRO_CONTENT_COLOR, width, height);
+	/* Paint canvas background first; image is drawn on top with zoom/origin */
+	cairo_set_source_rgb(cr, 0.92, 0.92, 0.92);
+	cairo_paint(cr);
 
-	first_cr = cairo_create(first);
-	cairo_scale(first_cr, tabData->viewZoom, tabData->viewZoom);
-	cairo_set_source_surface(first_cr, tabData->image, 0, 0);
-	cairo_paint(first_cr);
-	cairo_identity_matrix(first_cr);
+	cairo_save(cr);
+	cairo_translate(cr, tabData->viewOrigin[0], tabData->viewOrigin[1]);
+	cairo_scale(cr, tabData->viewZoom, tabData->viewZoom);
+	cairo_set_source_surface(cr, tabData->image, 0, 0);
+	cairo_paint(cr);
+	cairo_restore(cr);
 
 	for (i = 0; i < 4; i++) {
 		if (tabData->bpressed[i]) {
-			drawMarker(first_cr, (gint) (tabData->axiscoords[i][0]
-					* tabData->viewZoom), (gint) (tabData->axiscoords[i][1]
-					* tabData->viewZoom), i / 2);
+			drawMarker(cr, (gint) (tabData->axiscoords[i][0]
+					* tabData->viewZoom + tabData->viewOrigin[0]), (gint) (tabData->axiscoords[i][1]
+					* tabData->viewZoom + tabData->viewOrigin[1]), i / 2);
 		}
 	}
 
 	for (i = 0; i < tabData->numpoints; i++) {
-		drawMarker(first_cr, (gint) (tabData->points[i][0] * tabData->viewZoom),
-				(gint) (tabData->points[i][1] * tabData->viewZoom), 2);
+		drawMarker(cr,
+				(gint) (tabData->points[i][0] * tabData->viewZoom
+						+ tabData->viewOrigin[0]), (gint) (tabData->points[i][1]
+						* tabData->viewZoom + tabData->viewOrigin[1]), 2);
 	}
-
-	cairo_set_source_surface(cr, first, 0, 0);
-	cairo_paint(cr);
-
-	cairo_surface_destroy(first);
-
-	cairo_destroy(first_cr);
 
 	return TRUE;
 }
@@ -300,7 +790,7 @@ gboolean updateImageArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 /* This function sets the sensitivity of the buttons depending	*/
 /* the control variables.					*/
 /****************************************************************/
-void setButtonSensitivity(struct TabData *tabData) {
+static void setButtonSensitivity(struct TabData *tabData) {
 	char ttbuf[256];
 
 	if (tabData->Action == PRINT2FILE) {
@@ -399,7 +889,7 @@ void setNumberOfPointsEntryValue(GtkWidget *np_entry, gint np) {
 	gtk_entry_set_text(GTK_ENTRY(np_entry), buf);
 }
 
-void triggerUpdateDrawArea(GtkWidget *area) {
+static void triggerUpdateDrawArea(GtkWidget *area) {
 	gtk_widget_queue_draw(area);
 }
 
@@ -481,26 +971,15 @@ gint mouseButtonPressEvent(GtkWidget *widget, GdkEventButton *event,
 			setButtonSensitivity(tabData);
 		}
 	} else if (event->button == 2) { /* Is the middle button pressed ? */
-		for (i = 0; i < 2; i++)
-			if (!tabData->bpressed[i]) {
-				tabData->axiscoords[i][0] = imageX;
-				tabData->axiscoords[i][1] = imageY;
-				for (j = 0; j < 4; j++)
-					if (i != j)
-						gtk_widget_set_sensitive(tabData->setxybutton[j], TRUE);
-				gtk_widget_set_sensitive(tabData->xyentry[i], TRUE);
-				gtk_editable_set_editable((GtkEditable *) tabData->xyentry[i],
-						TRUE);
-				gtk_widget_grab_focus(tabData->xyentry[i]);
-				tabData->setxypressed[i] = FALSE;
-				tabData->bpressed[i] = TRUE;
-				gtk_toggle_button_set_active(
-						GTK_TOGGLE_BUTTON(tabData->setxybutton[i]), FALSE);
-				tabData->lastpoints[tabData->numlastpoints] = -(i + 1);
-				tabData->numlastpoints++;
-
-				break;
-			}
+		GtkAdjustment *hadj, *vadj;
+		hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+		vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+		tabData->middlePanning = TRUE;
+		tabData->middlePanMoved = FALSE;
+		tabData->middlePanStartMouse[0] = event->x_root;
+		tabData->middlePanStartMouse[1] = event->y_root;
+		tabData->middlePanStartAdj[0] = gtk_adjustment_get_value(hadj);
+		tabData->middlePanStartAdj[1] = gtk_adjustment_get_value(vadj);
 	} else if (event->button == 3) { /* Is the right button pressed ? */
 		for (i = 2; i < 4; i++)
 			if (!tabData->bpressed[i]) {
@@ -557,6 +1036,12 @@ gint mouseButtonReleaseEvent(GtkWidget *widget, GdkEventButton *event,
 			triggerUpdateDrawArea(tabData->drawing_area);
 		}
 	} else if (event->button == 2) {
+		if (tabData->middlePanning) {
+			if (!tabData->middlePanMoved)
+				applyMiddleButtonAxisShortcut(tabData, imageX, imageY);
+			tabData->middlePanning = FALSE;
+			tabData->middlePanMoved = FALSE;
+		}
 	} else if (event->button == 3) {
 	}
 	return TRUE;
@@ -576,6 +1061,44 @@ gint mouseMotionEvent(GtkWidget *widget, GdkEventMotion *event, gpointer data) {
 
 	(void) widget;
 	tabData = (struct TabData *) data;
+
+		if (tabData->middlePanning) {
+			GtkAdjustment *hadj, *vadj;
+			gdouble dx, dy, newH, newV, oldH, oldV;
+
+		hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+		vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+
+			dx = event->x_root - tabData->middlePanStartMouse[0];
+			dy = event->y_root - tabData->middlePanStartMouse[1];
+			if (fabs(dx) > 1.0 || fabs(dy) > 1.0)
+				tabData->middlePanMoved = TRUE;
+
+			oldH = gtk_adjustment_get_value(hadj);
+			oldV = gtk_adjustment_get_value(vadj);
+			(void) oldH;
+			(void) oldV;
+			newH = tabData->middlePanStartAdj[0] - dx;
+			newV = tabData->middlePanStartAdj[1] - dy;
+
+			if (newH < gtk_adjustment_get_lower(hadj))
+				newH = gtk_adjustment_get_lower(hadj);
+			if (newH > getAdjustmentUpperBound(hadj))
+				newH = getAdjustmentUpperBound(hadj);
+
+			if (newV < gtk_adjustment_get_lower(vadj))
+				newV = gtk_adjustment_get_lower(vadj);
+			if (newV > getAdjustmentUpperBound(vadj))
+				newV = getAdjustmentUpperBound(vadj);
+
+			gtk_adjustment_set_value(hadj, newH);
+			gtk_adjustment_set_value(vadj, newV);
+			G3DBG(
+					"middlePan: dx=%.2f dy=%.2f oldAdj=(%.2f,%.2f) newAdj=(%.2f,%.2f) upper=(%.2f,%.2f)\n",
+					dx, dy, oldH, oldV, newH, newV, getAdjustmentUpperBound(hadj),
+					getAdjustmentUpperBound(vadj));
+			return TRUE;
+		}
 
 	getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
 	/* on drawing area. */
@@ -628,24 +1151,109 @@ gint mouseMotionEvent(GtkWidget *widget, GdkEventMotion *event, gpointer data) {
 
 gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 	struct TabData *tabData;
+	GtkAdjustment *hadj, *vadj;
+	gdouble panStep;
+	gdouble deltaX, deltaY;
 	gdouble newZoom;
+	gdouble imageX, imageY;
+	gdouble focusX, focusY;
+	gint viewportX, viewportY;
+	gboolean ctrlDown, shiftDown;
 
-	(void) widget;
 	tabData = (struct TabData *) data;
+	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	ctrlDown = (event->state & GDK_CONTROL_MASK) != 0;
+	shiftDown = (event->state & GDK_SHIFT_MASK) != 0;
+	G3DBG(
+			"mouseScrollEvent: dir=%d state=0x%x delta=(%.4f,%.4f) ctrl=%d shift=%d x=%.2f y=%.2f\n",
+			(int) event->direction, (unsigned int) event->state, event->delta_x,
+			event->delta_y, ctrlDown, shiftDown, event->x, event->y);
 
-	if (!(event->state & GDK_CONTROL_MASK))
-		return FALSE;
+	if (ctrlDown) {
+		newZoom = tabData->viewZoom;
+		if (event->direction == GDK_SCROLL_UP) {
+			newZoom *= MAIN_IMAGE_ZOOM_STEP;
+		} else if (event->direction == GDK_SCROLL_DOWN) {
+			newZoom /= MAIN_IMAGE_ZOOM_STEP;
+		} else if (event->direction == GDK_SCROLL_SMOOTH) {
+			if (event->delta_y < 0.0) {
+				newZoom *= MAIN_IMAGE_ZOOM_STEP;
+			} else if (event->delta_y > 0.0) {
+				newZoom /= MAIN_IMAGE_ZOOM_STEP;
+			} else {
+				return TRUE;
+			}
+		} else {
+			return TRUE;
+		}
 
-	newZoom = tabData->viewZoom;
-	if (event->direction == GDK_SCROLL_UP) {
-		newZoom *= MAIN_IMAGE_ZOOM_STEP;
-	} else if (event->direction == GDK_SCROLL_DOWN) {
-		newZoom /= MAIN_IMAGE_ZOOM_STEP;
-	} else {
-		return FALSE;
+		getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
+		if (imageX >= 0.0 && imageY >= 0.0 && imageX < tabData->XSize
+				&& imageY < tabData->YSize) {
+			if (gtk_widget_translate_coordinates(widget, tabData->ViewPort,
+					(gint) event->x, (gint) event->y, &viewportX, &viewportY)) {
+				focusX = viewportX;
+				focusY = viewportY;
+			} else {
+				focusX = -1.0;
+				focusY = -1.0;
+			}
+		} else {
+			focusX = -1.0;
+			focusY = -1.0;
+		}
+
+		setMainImageZoom(tabData, newZoom, focusX, focusY);
+		return TRUE;
 	}
 
-	setMainImageZoom(tabData, newZoom, event->x, event->y);
+	panStep = MAX(30.0, gtk_adjustment_get_page_size(vadj) * 0.08);
+	deltaX = 0.0;
+	deltaY = 0.0;
+
+	if (event->direction == GDK_SCROLL_UP) {
+		deltaY = -panStep;
+	} else if (event->direction == GDK_SCROLL_DOWN) {
+		deltaY = panStep;
+	} else if (event->direction == GDK_SCROLL_LEFT) {
+		deltaX = -panStep;
+	} else if (event->direction == GDK_SCROLL_RIGHT) {
+		deltaX = panStep;
+	} else if (event->direction == GDK_SCROLL_SMOOTH) {
+		deltaX = event->delta_x * panStep;
+		deltaY = event->delta_y * panStep;
+	}
+
+	if (shiftDown && deltaX == 0.0)
+		deltaX = deltaY;
+
+	if (!shiftDown && event->direction != GDK_SCROLL_LEFT
+			&& event->direction != GDK_SCROLL_RIGHT)
+		deltaX = 0.0;
+
+	if (deltaX != 0.0) {
+		gdouble newH = gtk_adjustment_get_value(hadj) + deltaX;
+		gdouble hLower = gtk_adjustment_get_lower(hadj);
+		gdouble hUpper = getAdjustmentUpperBound(hadj);
+		if (newH < hLower)
+			newH = hLower;
+		if (newH > hUpper)
+			newH = hUpper;
+		gtk_adjustment_set_value(hadj, newH);
+	}
+
+	if (deltaY != 0.0 && !shiftDown) {
+		gdouble newV = gtk_adjustment_get_value(vadj) + deltaY;
+		gdouble vLower = gtk_adjustment_get_lower(vadj);
+		gdouble vUpper = getAdjustmentUpperBound(vadj);
+		if (newV < vLower)
+			newV = vLower;
+		if (newV > vUpper)
+			newV = vUpper;
+		gtk_adjustment_set_value(vadj, newV);
+	}
+
 	return TRUE;
 }
 
@@ -1002,6 +1610,8 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 
 	tabData->XSize = cairo_image_surface_get_width(tabData->image);
 	tabData->YSize = cairo_image_surface_get_height(tabData->image);
+	G3DBG("addImageToTab: loaded '%s' image=%dx%d scale_arg=%.6f\n", filename,
+			tabData->XSize, tabData->YSize, Scale);
 
 	mScale = -1;
 	if (maxX != -1 && maxY != -1) {
@@ -1040,8 +1650,12 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 	}
 
 	tabData->drawing_area = gtk_drawing_area_new(); /* Create new drawing area */
-	gtk_widget_set_size_request(tabData->drawing_area, tabData->XSize,
-			tabData->YSize);
+	tabData->viewOrigin[0] = MAIN_IMAGE_CANVAS_MIN_PAD;
+	tabData->viewOrigin[1] = MAIN_IMAGE_CANVAS_MIN_PAD;
+	tabData->viewCanvasSize[0] = tabData->XSize + 2.0 * MAIN_IMAGE_CANVAS_MIN_PAD;
+	tabData->viewCanvasSize[1] = tabData->YSize + 2.0 * MAIN_IMAGE_CANVAS_MIN_PAD;
+	gtk_widget_set_size_request(tabData->drawing_area,
+			(gint) tabData->viewCanvasSize[0], (gint) tabData->viewCanvasSize[1]);
 
 	g_signal_connect(G_OBJECT (tabData->drawing_area), "draw",
 			G_CALLBACK (updateImageArea), tabData);
@@ -1072,12 +1686,17 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 			tabData->drawing_area);
 
 	gtk_widget_show(tabData->drawing_area);
+	debugDumpViewportState("addImageToTab:after_drawing_area_show", tabData);
 
 	display = gtk_widget_get_display(tabData->drawing_area);
 	cursor = gdk_cursor_new_for_display(display, GDK_CROSSHAIR);
 	gdk_window_set_cursor(gtk_widget_get_parent_window(tabData->drawing_area),
 			cursor);
 	g_object_unref(cursor);
+
+	tabData->pendingInitialZoomToFit = TRUE;
+	g_idle_add(applyInitialZoomToFit, tabData);
+	debugDumpViewportState("addImageToTab:scheduled_initial_fit", tabData);
 
 	return 0;
 }
@@ -1217,6 +1836,12 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	tabData->mousePointerCoords[0] = -1.0;
 	tabData->mousePointerCoords[1] = -1.0;
 	tabData->viewZoom = 1.0;
+	tabData->viewOrigin[0] = MAIN_IMAGE_CANVAS_MIN_PAD;
+	tabData->viewOrigin[1] = MAIN_IMAGE_CANVAS_MIN_PAD;
+	tabData->viewCanvasSize[0] = 2.0 * MAIN_IMAGE_CANVAS_MIN_PAD;
+	tabData->viewCanvasSize[1] = 2.0 * MAIN_IMAGE_CANVAS_MIN_PAD;
+	tabData->XSize = 0;
+	tabData->YSize = 0;
 
 	tabData->logxy[0] = FALSE;
 	tabData->logxy[1] = FALSE;
@@ -1231,6 +1856,10 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	tabData->lastpoints = NULL;
 
 	tabData->movedPointIndex = NONESELECTED;
+	tabData->middlePanning = FALSE;
+	tabData->middlePanMoved = FALSE;
+	tabData->pendingInitialZoomToFit = FALSE;
+	tabData->deferredRecenterRetries = 0;
 
 	for (i = 0; i < 4; i++) {
 		tabData->xyentry[i] = gtk_entry_new(); /* Create text entry */
@@ -1541,6 +2170,8 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	gtk_scrolled_window_set_policy((GtkScrolledWindow *) ScrollWindow,
 			GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
 	tabData->ViewPort = gtk_viewport_new(NULL, NULL);
+	g_signal_connect(G_OBJECT(tabData->ViewPort), "size-allocate",
+			G_CALLBACK(viewportSizeAllocateEvent), tabData);
 
 	gtk_box_pack_start(GTK_BOX (brvbox), ScrollWindow, TRUE, TRUE, 0);
 	drawing_area_alignment = g3AlignmentNew(0, 0, 0, 0);
@@ -1602,6 +2233,8 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 		if (tabData->oppropbox != NULL
 		)
 			gtk_widget_hide(tabData->oppropbox);
+
+	addRecentFile(filename);
 
 	return 0;
 }
@@ -1790,6 +2423,47 @@ GCallback toggleFullscreen(GtkWidget *widget, gpointer func_data) {
 	return NULL;
 }
 
+static struct TabData *getCurrentTabData(void) {
+	gint page_num;
+	GtkWidget *page;
+
+	if (gtk_notebook_get_n_pages((GtkNotebook *) mainnotebook) <= 0)
+		return NULL;
+
+	page_num = gtk_notebook_get_current_page((GtkNotebook *) mainnotebook);
+	page = gtk_notebook_get_nth_page((GtkNotebook *) mainnotebook, page_num);
+	if (page == NULL)
+		return NULL;
+	return (struct TabData *) g_object_get_data(G_OBJECT(page), DATA_STORE_NAME);
+}
+
+void zoomView100(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData;
+	(void) widget;
+	(void) data;
+	tabData = getCurrentTabData();
+	if (tabData != NULL)
+		setMainImageZoom(tabData, 1.0, -1.0, -1.0);
+}
+
+void zoomView200(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData;
+	(void) widget;
+	(void) data;
+	tabData = getCurrentTabData();
+	if (tabData != NULL)
+		setMainImageZoom(tabData, 2.0, -1.0, -1.0);
+}
+
+void zoomViewToFit(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData;
+	(void) widget;
+	(void) data;
+	tabData = getCurrentTabData();
+	if (tabData != NULL)
+		zoomToFitAndCenter(tabData);
+}
+
 /****************************************************************/
 /* This callback handles the hide zoom area toggling.		*/
 /****************************************************************/
@@ -1899,7 +2573,8 @@ int main(int argc, char **argv) {
 	GtkWidget *open_item, *quit_item, *about_item;
 	GtkWidget *zoom_area_item, *axis_settings_item, *output_properties_item;
 	GtkWidget *fullscreen_item;
-	GtkWidget *separator_item;
+	GtkWidget *zoom100_item, *zoom200_item, *zoomfit_item;
+	GtkWidget *separator_item, *separator_item2;
 	GtkAccelGroup *accel_group;
 
 	gtk_init(&argc, &argv); /* Init GTK */
@@ -2024,6 +2699,8 @@ int main(int argc, char **argv) {
 	file_menu = gtk_menu_new();
 	view_menu = gtk_menu_new();
 	help_menu = gtk_menu_new();
+	file_menu_widget = file_menu;
+	recent_menu_items = g_ptr_array_new();
 
 	file_root_item = gtk_menu_item_new_with_mnemonic("_File");
 	view_root_item = gtk_menu_item_new_with_mnemonic("_View");
@@ -2039,20 +2716,33 @@ int main(int argc, char **argv) {
 	gtk_widget_set_sensitive(close_menu_item, FALSE);
 
 	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), open_item);
-	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), close_menu_item);
 	separator_item = gtk_separator_menu_item_new();
 	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), separator_item);
+	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), close_menu_item);
+	separator_item2 = gtk_separator_menu_item_new();
+	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), separator_item2);
 	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), quit_item);
+
+	loadRecentFiles();
+	rebuildRecentFileMenu();
 
 	zoom_area_item = gtk_check_menu_item_new_with_label("Zoom area");
 	axis_settings_item = gtk_check_menu_item_new_with_label("Axis settings");
 	output_properties_item =
 			gtk_check_menu_item_new_with_label("Output properties");
 	fullscreen_item = gtk_check_menu_item_new_with_mnemonic("_Full Screen");
+	zoom100_item = gtk_menu_item_new_with_label("Zoom 100%");
+	zoom200_item = gtk_menu_item_new_with_label("Zoom 200%");
+	zoomfit_item = gtk_menu_item_new_with_label("Zoom to fit");
 
 	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), zoom_area_item);
 	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), axis_settings_item);
 	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), output_properties_item);
+	separator_item = gtk_separator_menu_item_new();
+	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), separator_item);
+	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), zoom100_item);
+	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), zoom200_item);
+	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), zoomfit_item);
 	separator_item = gtk_separator_menu_item_new();
 	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), separator_item);
 	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), fullscreen_item);
@@ -2081,6 +2771,12 @@ int main(int argc, char **argv) {
 			G_CALLBACK(hideOutputProperties), NULL);
 	g_signal_connect(G_OBJECT(fullscreen_item), "toggled",
 			G_CALLBACK(toggleFullscreen), NULL);
+	g_signal_connect(G_OBJECT(zoom100_item), "activate", G_CALLBACK(zoomView100),
+			NULL);
+	g_signal_connect(G_OBJECT(zoom200_item), "activate", G_CALLBACK(zoomView200),
+			NULL);
+	g_signal_connect(G_OBJECT(zoomfit_item), "activate", G_CALLBACK(zoomViewToFit),
+			NULL);
 
 	gtk_widget_add_accelerator(open_item, "activate", accel_group, GDK_KEY_O,
 			GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
@@ -2099,6 +2795,12 @@ int main(int argc, char **argv) {
 			GDK_KEY_F7, 0, GTK_ACCEL_VISIBLE);
 	gtk_widget_add_accelerator(fullscreen_item, "activate", accel_group,
 			GDK_KEY_F11, 0, GTK_ACCEL_VISIBLE);
+	gtk_widget_add_accelerator(zoom100_item, "activate", accel_group, GDK_KEY_1,
+			GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
+	gtk_widget_add_accelerator(zoom200_item, "activate", accel_group, GDK_KEY_2,
+			GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
+	gtk_widget_add_accelerator(zoomfit_item, "activate", accel_group, GDK_KEY_3,
+			GDK_CONTROL_MASK, GTK_ACCEL_VISIBLE);
 
 	gtk_box_pack_start(GTK_BOX (mainvbox), menubar, FALSE, FALSE, 0);
 

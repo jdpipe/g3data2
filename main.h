@@ -94,10 +94,20 @@ struct TabData {
 
 	gdouble mousePointerCoords[2];
 	gdouble viewZoom;
+	gdouble viewOrigin[2];
+	gdouble viewCanvasSize[2];
 
 	gint movedPointIndex;
 	gdouble movedOrigCoords[2];
 	gdouble movedOrigMousePtrCoords[2];
+
+	gboolean middlePanning;
+	gboolean middlePanMoved;
+	gdouble middlePanStartMouse[2];
+	gdouble middlePanStartAdj[2];
+	gboolean pendingInitialZoomToFit;
+	gboolean pendingRecenterOnAdjust;
+	gint deferredRecenterRetries;
 };
 
 struct ButtonData {

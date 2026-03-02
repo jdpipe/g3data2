@@ -1,4 +1,5 @@
 import os
+from SCons.Variables import BoolVariable
 
 
 def _check_pkg_config(context, package_spec):
@@ -22,7 +23,10 @@ int main(void) { return 0; }
     return ok
 
 
-env = Environment(ENV=os.environ)
+vars = Variables()
+vars.Add(BoolVariable("DEBUG", "Enable debug logging (G3DATA2_DEBUG)", False))
+
+env = Environment(ENV=os.environ, variables=vars)
 
 conf = Configure(
     env,
@@ -62,6 +66,10 @@ env = conf.Finish()
 
 env.Append(CCFLAGS=["-Wall"])
 env.Append(LIBS=["m"])
+
+if env["DEBUG"]:
+    env.Append(CPPDEFINES=["G3DATA2_DEBUG"])
+    print("Build mode: DEBUG (G3DATA2_DEBUG enabled)")
 
 sources = ["main.c", "sort.c", "points.c", "drawing.c"]
 env.Program(target="g3data2", source=sources)
