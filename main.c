@@ -54,6 +54,7 @@ static const char *DATA_STORE_NAME = "tabdatastruct";
 static const gdouble MAIN_IMAGE_MIN_ZOOM = 0.05;
 static const gdouble MAIN_IMAGE_MAX_ZOOM = 8.0;
 static const gdouble MAIN_IMAGE_ZOOM_STEP = 1.25;
+static const gdouble ZOOM_AREA_VIEW_MULTIPLIER = 2.0;
 static const gdouble MAIN_IMAGE_CANVAS_MIN_PAD = 512.0;
 static const gint MAX_RECENT_FILES = 6;
 static const gint START_TILE_THUMB_W = 160;
@@ -613,25 +614,29 @@ gboolean updateZoomArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 	cairo_t *first_cr;
 	cairo_surface_t *first;
 	struct TabData *tabData;
+	gdouble zoomAreaScale;
 
 	tabData = (struct TabData *) data;
 
 	if (tabData->mousePointerCoords[0] >= 0 && tabData->mousePointerCoords[1] >= 0) {
+		zoomAreaScale = tabData->viewZoom * ZOOM_AREA_VIEW_MULTIPLIER;
+		if (zoomAreaScale <= 0.0)
+			zoomAreaScale = ZOOM_AREA_VIEW_MULTIPLIER;
 
 		first = cairo_surface_create_similar(cairo_get_target(cr),
 				CAIRO_CONTENT_COLOR, ZOOMPIXSIZE, ZOOMPIXSIZE);
 
 		first_cr = cairo_create(first);
-		cairo_scale(first_cr, ZOOMFACTOR, ZOOMFACTOR);
+		cairo_scale(first_cr, zoomAreaScale, zoomAreaScale);
 		cairo_set_source_surface(
 				first_cr,
 				tabData->image,
 				-tabData->mousePointerCoords[0]
-						+ ZOOMPIXSIZE / (2 * ZOOMFACTOR),
+						+ ZOOMPIXSIZE / (2 * zoomAreaScale),
 				-tabData->mousePointerCoords[1]
-						+ ZOOMPIXSIZE / (2 * ZOOMFACTOR));
+						+ ZOOMPIXSIZE / (2 * zoomAreaScale));
 		cairo_paint(first_cr);
-		cairo_scale(first_cr, 1.0 / ZOOMFACTOR, 1.0 / ZOOMFACTOR);
+		cairo_scale(first_cr, 1.0 / zoomAreaScale, 1.0 / zoomAreaScale);
 
 		drawMarker(first_cr, ZOOMPIXSIZE / 2, ZOOMPIXSIZE / 2, 2);
 
@@ -662,6 +667,68 @@ static gdouble getAdjustmentUpperBound(GtkAdjustment *adjustment) {
 	if (upper < lower)
 		upper = lower;
 	return upper;
+}
+
+static gdouble clampAdjustmentValue(GtkAdjustment *adjustment, gdouble value) {
+	gdouble lower, upper;
+
+	lower = gtk_adjustment_get_lower(adjustment);
+	upper = getAdjustmentUpperBound(adjustment);
+
+	if (value < lower)
+		return lower;
+	if (value > upper)
+		return upper;
+	return value;
+}
+
+static gboolean adjustmentBoundsCoverCanvas(struct TabData *tabData,
+		gdouble canvasW, gdouble canvasH) {
+	GtkAdjustment *hadj, *vadj;
+	gdouble hUpper, vUpper;
+
+	if (tabData == NULL || tabData->ViewPort == NULL)
+		return FALSE;
+
+	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	hUpper = gtk_adjustment_get_upper(hadj);
+	vUpper = gtk_adjustment_get_upper(vadj);
+
+	return hUpper + 1.0 >= canvasW && vUpper + 1.0 >= canvasH;
+}
+
+static void maybeApplyPendingZoomScroll(struct TabData *tabData) {
+	GtkAdjustment *hadj, *vadj;
+	gdouble hNew, vNew;
+
+	if (tabData == NULL || !tabData->pendingZoomScrollOnAdjust
+			|| tabData->ViewPort == NULL)
+		return;
+
+	if (!adjustmentBoundsCoverCanvas(tabData,
+			tabData->pendingZoomScrollCanvasSize[0],
+			tabData->pendingZoomScrollCanvasSize[1])) {
+		G3DBG(
+				"maybeApplyPendingZoomScroll: waiting target=(%.2f,%.2f) canvas=(%.2f,%.2f)\n",
+				tabData->pendingZoomScrollTarget[0],
+				tabData->pendingZoomScrollTarget[1],
+				tabData->pendingZoomScrollCanvasSize[0],
+				tabData->pendingZoomScrollCanvasSize[1]);
+		return;
+	}
+
+	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	hNew = clampAdjustmentValue(hadj, tabData->pendingZoomScrollTarget[0]);
+	vNew = clampAdjustmentValue(vadj, tabData->pendingZoomScrollTarget[1]);
+
+	gtk_adjustment_set_value(hadj, hNew);
+	gtk_adjustment_set_value(vadj, vNew);
+	tabData->pendingZoomScrollOnAdjust = FALSE;
+	G3DBG("maybeApplyPendingZoomScroll: applied target=(%.2f,%.2f)\n",
+			hNew, vNew);
+	debugDumpViewportState("maybeApplyPendingZoomScroll:end", tabData);
 }
 
 static void getViewportSize(struct TabData *tabData, gdouble *pageW, gdouble *pageH) {
@@ -744,6 +811,8 @@ static void setMainImageZoom(struct TabData *tabData, gdouble newZoom,
 	gtk_widget_queue_resize(tabData->drawing_area);
 	gtk_widget_queue_resize(tabData->ViewPort);
 	gtk_widget_queue_draw(tabData->drawing_area);
+	if (tabData->zoom_area != NULL)
+		gtk_widget_queue_draw(tabData->zoom_area);
 
 	hNewValue = hImgFocus * newZoom + newOriginX - focusX;
 	vNewValue = vImgFocus * newZoom + newOriginY - focusY;
@@ -762,8 +831,12 @@ static void setMainImageZoom(struct TabData *tabData, gdouble newZoom,
 	if (vNewValue > vMax)
 		vNewValue = vMax;
 
-	gtk_adjustment_set_value(hadj, hNewValue);
-	gtk_adjustment_set_value(vadj, vNewValue);
+	tabData->pendingZoomScrollTarget[0] = hNewValue;
+	tabData->pendingZoomScrollTarget[1] = vNewValue;
+	tabData->pendingZoomScrollCanvasSize[0] = newCanvasW;
+	tabData->pendingZoomScrollCanvasSize[1] = newCanvasH;
+	tabData->pendingZoomScrollOnAdjust = TRUE;
+	maybeApplyPendingZoomScroll(tabData);
 	G3DBG(
 			"setMainImageZoom:end newZoom=%.6f focus=(%.2f,%.2f) page=(%.2f,%.2f) newOrigin=(%.2f,%.2f) newCanvas=(%.2f,%.2f) newAdj=(%.2f,%.2f)\n",
 			newZoom, focusX, focusY, pageW, pageH, newOriginX, newOriginY, newCanvasW,
@@ -824,23 +897,24 @@ static void centerImageInView(struct TabData *tabData) {
 }
 
 static void maybeApplyPendingRecenter(struct TabData *tabData) {
-	GtkAdjustment *hadj, *vadj;
-	gdouble hUpper, vUpper;
-
 	if (tabData == NULL || !tabData->pendingRecenterOnAdjust
 			|| tabData->ViewPort == NULL)
 		return;
 
-	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
-	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
-	hUpper = gtk_adjustment_get_upper(hadj);
-	vUpper = gtk_adjustment_get_upper(vadj);
+	if (!adjustmentBoundsCoverCanvas(tabData, tabData->viewCanvasSize[0],
+			tabData->viewCanvasSize[1])) {
+#ifdef G3DATA2_DEBUG
+		GtkAdjustment *hadj, *vadj;
+		gdouble hUpper, vUpper;
 
-	if (hUpper + 1.0 < tabData->viewCanvasSize[0]
-			|| vUpper + 1.0 < tabData->viewCanvasSize[1]) {
+		hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+		vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+		hUpper = gtk_adjustment_get_upper(hadj);
+		vUpper = gtk_adjustment_get_upper(vadj);
 		G3DBG(
 				"maybeApplyPendingRecenter: waiting (bounds too small) upper=(%.2f,%.2f) canvas=(%.2f,%.2f)\n",
 				hUpper, vUpper, tabData->viewCanvasSize[0], tabData->viewCanvasSize[1]);
+#endif
 		return;
 	}
 
@@ -856,6 +930,7 @@ static void adjustmentChangedEvent(GtkAdjustment *adjustment, gpointer data) {
 
 	tabData = (struct TabData *) data;
 	debugDumpViewportState("adjustmentChangedEvent", tabData);
+	maybeApplyPendingZoomScroll(tabData);
 	maybeApplyPendingRecenter(tabData);
 }
 
@@ -898,6 +973,7 @@ static void viewportSizeAllocateEvent(GtkWidget *widget, GtkAllocation *allocati
 	G3DBG("viewportSizeAllocateEvent: alloc=%dx%d\n", allocation->width,
 			allocation->height);
 	maybeApplyInitialZoomToFit((struct TabData *) data);
+	maybeApplyPendingZoomScroll((struct TabData *) data);
 	maybeApplyPendingRecenter((struct TabData *) data);
 }
 
@@ -1406,7 +1482,6 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 	gdouble newZoom;
 	gdouble imageX, imageY;
 	gdouble focusX, focusY;
-	gint viewportX, viewportY;
 	gboolean ctrlDown, shiftDown;
 
 	tabData = (struct TabData *) data;
@@ -1437,20 +1512,17 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 			return TRUE;
 		}
 
-		getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
-		if (imageX >= 0.0 && imageY >= 0.0 && imageX < tabData->XSize
-				&& imageY < tabData->YSize) {
-			if (gtk_widget_translate_coordinates(widget, tabData->ViewPort,
-					(gint) event->x, (gint) event->y, &viewportX, &viewportY)) {
-				focusX = viewportX;
-				focusY = viewportY;
-			} else {
-				focusX = -1.0;
-				focusY = -1.0;
-			}
-		} else {
+		if (tabData->XSize <= 0 || tabData->YSize <= 0) {
 			focusX = -1.0;
 			focusY = -1.0;
+		} else {
+			getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
+			imageX = CLAMP(imageX, 0.0, tabData->XSize - 1.0);
+			imageY = CLAMP(imageY, 0.0, tabData->YSize - 1.0);
+			focusX = imageX * tabData->viewZoom + tabData->viewOrigin[0]
+					- gtk_adjustment_get_value(hadj);
+			focusY = imageY * tabData->viewZoom + tabData->viewOrigin[1]
+					- gtk_adjustment_get_value(vadj);
 		}
 
 		setMainImageZoom(tabData, newZoom, focusX, focusY);
@@ -2115,6 +2187,11 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	tabData->middlePanMoved = FALSE;
 	tabData->pendingInitialZoomToFit = FALSE;
 	tabData->pendingRecenterOnAdjust = FALSE;
+	tabData->pendingZoomScrollOnAdjust = FALSE;
+	tabData->pendingZoomScrollTarget[0] = 0.0;
+	tabData->pendingZoomScrollTarget[1] = 0.0;
+	tabData->pendingZoomScrollCanvasSize[0] = 0.0;
+	tabData->pendingZoomScrollCanvasSize[1] = 0.0;
 
 	for (i = 0; i < 4; i++) {
 		tabData->xyentry[i] = gtk_entry_new(); /* Create text entry */
