@@ -35,7 +35,7 @@ Authors email : jonas@frantz.fi
 #define MAXNUMFILES 256
 #define GRABTRESHOLD MARKERSIZE*2
 
-#define ACTIONBNUM 2
+#define ACTIONBNUM 3
 #define ORDERBNUM 3
 #define LOGBNUM 2
 
@@ -48,7 +48,7 @@ struct PointValue {
 };
 
 typedef enum {
-	PRINT2STDOUT = 0, PRINT2FILE
+	PRINT2STDOUT = 0, PRINT2FILE, COPY2CLIPBOARD
 } ACTION;
 
 typedef enum {

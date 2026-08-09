@@ -93,7 +93,8 @@ gchar orderlabel[ORDERBNUM][40] = {"No ordering",
                                    "Based on Y value"};
 
 gchar actionlabel[ACTIONBNUM][32] = {"Export data to stdout",
-			             "Export data to file"};
+			             "Export data to file",
+			             "Copy data to clipboard"};
                                                                                                                                                                     
 gchar loglabel[LOGBNUM][32] = {"_X axis is logarithmic",
                                "_Y axis is logarithmic"};
@@ -176,6 +177,8 @@ gchar removeatt[] =	"This button removes all put out points except the axispoint
 gchar printrestt[] =	"Print data to stdout";
 
 gchar printfilett[] =	"Print data to file %s";
+
+gchar copyclipboardtt[] = "Copy data to the clipboard";
 
 gchar filenamett[] =	"This entry should contain the name of the file to print data to";
 

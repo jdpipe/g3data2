@@ -28,7 +28,8 @@ scons
 It's fairly self-explanatory. But to be explicit:
 
 * you first have to identify the left and right end of your x and y axes in the plot. This sets the transformation from pixel to data coordinates
-* next you click points in the graph, amassing a list of points that can be either output to stdout or output to a `.dat` text file that you can name.
+* next you click points in the graph, amassing a list of points that can be copied to the clipboard, output to stdout, or written to a `.dat` text file that you can name.
+* sampled points are kept as double-precision image pixel coordinates. Data coordinates are recalculated from the current axis calibration whenever they are displayed or exported.
 * note that you can zoom in using ctrl-wheel, pan up and down with the mouse wheel, and pan left and right with shift-wheel.
 * zooming in is a good idea when selecting points. g3data2 has sub-pixel precision for identifying and working with point data.
 * if you want to extract multiple curves from the same plot, you can save your points, then change the file name, click 'remove all points', and start again.

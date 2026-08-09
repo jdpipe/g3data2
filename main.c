@@ -76,6 +76,7 @@ static const char *DROPPED_URI_DELIMITER = "\r\n";
 
 static void setButtonSensitivity(struct TabData *tabData);
 static void triggerUpdateDrawArea(GtkWidget *area);
+static void refreshProcessingInformation(struct TabData *tabData);
 gint setupNewTab(char *filename, gdouble Scale, gdouble maxX,
 		gdouble maxY, gboolean UsePreSetCoords, gdouble *TempCoords,
 		gboolean *Uselogxy, gboolean *UseError);
@@ -1070,6 +1071,9 @@ static void applyMiddleButtonAxisShortcut(struct TabData *tabData, gdouble image
 			tabData->numlastpoints++;
 			setButtonSensitivity(tabData);
 			triggerUpdateDrawArea(tabData->drawing_area);
+			tabData->mousePointerCoords[0] = imageX;
+			tabData->mousePointerCoords[1] = imageY;
+			refreshProcessingInformation(tabData);
 			break;
 		}
 	}
@@ -1117,6 +1121,13 @@ gboolean updateImageArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 /****************************************************************/
 static void setButtonSensitivity(struct TabData *tabData) {
 	char ttbuf[256];
+	gboolean exportReady;
+
+	exportReady = tabData->valueset[0] && tabData->valueset[1]
+			&& tabData->valueset[2] && tabData->valueset[3]
+			&& tabData->bpressed[0] && tabData->bpressed[1]
+			&& tabData->bpressed[2] && tabData->bpressed[3]
+			&& tabData->numpoints > 0;
 
 	if (tabData->Action == PRINT2FILE) {
 		snprintf(ttbuf, sizeof(ttbuf), printfilett,
@@ -1124,24 +1135,13 @@ static void setButtonSensitivity(struct TabData *tabData) {
 		gtk_widget_set_tooltip_text(tabData->exportbutton, ttbuf);
 
 		gtk_widget_set_sensitive(tabData->file_entry, TRUE);
-		if (tabData->valueset[0] && tabData->valueset[1] && tabData->valueset[2]
-				&& tabData->valueset[3] && tabData->bpressed[0]
-				&& tabData->bpressed[1] && tabData->bpressed[2]
-				&& tabData->bpressed[3] && tabData->numpoints > 0
-				&& tabData->file_name_length > 0)
-			gtk_widget_set_sensitive(tabData->exportbutton, TRUE);
-		else
-			gtk_widget_set_sensitive(tabData->exportbutton, FALSE);
+		gtk_widget_set_sensitive(tabData->exportbutton,
+				exportReady && tabData->file_name_length > 0);
 	} else {
-		gtk_widget_set_tooltip_text(tabData->exportbutton, printrestt);
+		gtk_widget_set_tooltip_text(tabData->exportbutton,
+				tabData->Action == COPY2CLIPBOARD ? copyclipboardtt : printrestt);
 		gtk_widget_set_sensitive(tabData->file_entry, FALSE);
-		if (tabData->valueset[0] && tabData->valueset[1] && tabData->valueset[2]
-				&& tabData->valueset[3] && tabData->bpressed[0]
-				&& tabData->bpressed[1] && tabData->bpressed[2]
-				&& tabData->bpressed[3] && tabData->numpoints > 0)
-			gtk_widget_set_sensitive(tabData->exportbutton, TRUE);
-		else
-			gtk_widget_set_sensitive(tabData->exportbutton, FALSE);
+		gtk_widget_set_sensitive(tabData->exportbutton, exportReady);
 	}
 
 	if (tabData->numlastpoints == 0) {
@@ -1151,6 +1151,47 @@ static void setButtonSensitivity(struct TabData *tabData) {
 		gtk_widget_set_sensitive(tabData->remlastbutton, TRUE);
 		gtk_widget_set_sensitive(tabData->remallbutton, TRUE);
 	}
+}
+
+static void clearProcessingInformation(struct TabData *tabData) {
+	gtk_entry_set_text(GTK_ENTRY(tabData->xc_entry), "");
+	gtk_entry_set_text(GTK_ENTRY(tabData->yc_entry), "");
+	gtk_entry_set_text(GTK_ENTRY(tabData->xerr_entry), "");
+	gtk_entry_set_text(GTK_ENTRY(tabData->yerr_entry), "");
+}
+
+/* Keep the coordinate readout in sync when calibration changes without
+ * requiring the user to move the pointer again. */
+static void refreshProcessingInformation(struct TabData *tabData) {
+	gint i;
+	gchar buf[32];
+	struct PointValue calculatedValue;
+
+	if (tabData->mousePointerCoords[0] < 0
+			|| tabData->mousePointerCoords[1] < 0
+			|| tabData->mousePointerCoords[0] >= tabData->XSize
+			|| tabData->mousePointerCoords[1] >= tabData->YSize) {
+		clearProcessingInformation(tabData);
+		return;
+	}
+
+	for (i = 0; i < 4; i++) {
+		if (!tabData->valueset[i] || !tabData->bpressed[i]) {
+			clearProcessingInformation(tabData);
+			return;
+		}
+	}
+
+	calculatedValue = calculatePointValue(tabData->mousePointerCoords[0],
+			tabData->mousePointerCoords[1], tabData);
+	snprintf(buf, sizeof(buf), "%16.10g", calculatedValue.Xv);
+	gtk_entry_set_text(GTK_ENTRY(tabData->xc_entry), buf);
+	snprintf(buf, sizeof(buf), "%16.10g", calculatedValue.Yv);
+	gtk_entry_set_text(GTK_ENTRY(tabData->yc_entry), buf);
+	snprintf(buf, sizeof(buf), "%16.10g", calculatedValue.Xerr);
+	gtk_entry_set_text(GTK_ENTRY(tabData->xerr_entry), buf);
+	snprintf(buf, sizeof(buf), "%16.10g", calculatedValue.Yerr);
+	gtk_entry_set_text(GTK_ENTRY(tabData->yerr_entry), buf);
 }
 
 gboolean allocatePointDataMemory(struct TabData *tabData) {
@@ -1329,6 +1370,12 @@ gint mouseButtonPressEvent(GtkWidget *widget, GdkEventButton *event,
 	}
 
 	triggerUpdateDrawArea(tabData->drawing_area);
+	if (imageX >= 0 && imageY >= 0 && imageX < tabData->XSize
+			&& imageY < tabData->YSize) {
+		tabData->mousePointerCoords[0] = imageX;
+		tabData->mousePointerCoords[1] = imageY;
+	}
+	refreshProcessingInformation(tabData);
 
 	setButtonSensitivity(tabData);
 	return TRUE;
@@ -1380,8 +1427,6 @@ gint mouseButtonReleaseEvent(GtkWidget *widget, GdkEventButton *event,
 gint mouseMotionEvent(GtkWidget *widget, GdkEventMotion *event, gpointer data) {
 	gint i;
 	gdouble imageX, imageY;
-	gchar buf[32];
-	struct PointValue CalcVal;
 	struct TabData *tabData;
 
 	(void) widget;
@@ -1447,29 +1492,9 @@ gint mouseMotionEvent(GtkWidget *widget, GdkEventMotion *event, gpointer data) {
 
 		triggerUpdateDrawArea(tabData->zoom_area);
 
-		if (tabData->valueset[0] && tabData->valueset[1] && tabData->valueset[2]
-				&& tabData->valueset[3]) {
-			CalcVal = calculatePointValue(imageX, imageY, tabData);
-
-			sprintf(buf, "%16.10g", CalcVal.Xv);
-			gtk_entry_set_text(GTK_ENTRY(tabData->xc_entry), buf); /* Put out coordinates in entries */
-			sprintf(buf, "%16.10g", CalcVal.Yv);
-			gtk_entry_set_text(GTK_ENTRY(tabData->yc_entry), buf);
-			sprintf(buf, "%16.10g", CalcVal.Xerr);
-			gtk_entry_set_text(GTK_ENTRY(tabData->xerr_entry), buf); /* Put out coordinates in entries */
-			sprintf(buf, "%16.10g", CalcVal.Yerr);
-			gtk_entry_set_text(GTK_ENTRY(tabData->yerr_entry), buf);
-		} else {
-			gtk_entry_set_text(GTK_ENTRY(tabData->xc_entry), ""); /* Else clear entries */
-			gtk_entry_set_text(GTK_ENTRY(tabData->yc_entry), "");
-			gtk_entry_set_text(GTK_ENTRY(tabData->xerr_entry), "");
-			gtk_entry_set_text(GTK_ENTRY(tabData->yerr_entry), "");
-		}
+		refreshProcessingInformation(tabData);
 	} else {
-		gtk_entry_set_text(GTK_ENTRY(tabData->xc_entry), ""); /* Else clear entries */
-		gtk_entry_set_text(GTK_ENTRY(tabData->yc_entry), "");
-		gtk_entry_set_text(GTK_ENTRY(tabData->xerr_entry), "");
-		gtk_entry_set_text(GTK_ENTRY(tabData->yerr_entry), "");
+		clearProcessingInformation(tabData);
 	}
 	return TRUE;
 }
@@ -1604,6 +1629,7 @@ void setAxisMarkerSetMode(GtkToggleButton *widget, gpointer data) {
 		}
 		tabData->bpressed[index] = FALSE; /* Set x axis point 1 to unset */
 		gtk_widget_queue_draw(tabData->drawing_area);
+		refreshProcessingInformation(tabData);
 	} else { /* If button is trying to get unpressed */
 		if (tabData->setxypressed[index])
 			gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), TRUE); /* Set button down */
@@ -1632,6 +1658,8 @@ void setOutputAction(GtkWidget *widget, gpointer data) {
 	struct TabData *tabData;
 
 	buttonData = (struct ButtonData *) data;
+	if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget)))
+		return;
 	action = buttonData->index;
 	tabData = buttonData->tabData;
 	tabData->Action = action;
@@ -1653,7 +1681,10 @@ void setPrintErrorUsage(GtkToggleButton *widget, gpointer data) {
 /* this function gets called.					*/
 /****************************************************************/
 void readXYEntryValues(GtkWidget *entry, gpointer data) {
-	gchar *xy_text;
+	const gchar *xy_text;
+	gchar *end;
+	gdouble value;
+	gboolean valid;
 	gint index;
 	struct ButtonData *buttonData;
 	struct TabData *tabData;
@@ -1662,16 +1693,19 @@ void readXYEntryValues(GtkWidget *entry, gpointer data) {
 	index = buttonData->index;
 	tabData = buttonData->tabData;
 
-	xy_text = (gchar *) gtk_entry_get_text(GTK_ENTRY (entry));
-	sscanf(xy_text, "%lf", &(tabData->realcoords[index]));
-	if (tabData->logxy[index / 2] && tabData->realcoords[index] > 0)
-		tabData->valueset[index] = TRUE;
-	else if (tabData->logxy[index / 2])
-		tabData->valueset[index] = FALSE;
-	else
-		tabData->valueset[index] = TRUE;
+	xy_text = gtk_entry_get_text(GTK_ENTRY(entry));
+	value = g_ascii_strtod(xy_text, &end);
+	valid = end != xy_text;
+	while (g_ascii_isspace(*end))
+		end++;
+	valid = valid && *end == '\0' && isfinite(value);
+	if (valid)
+		tabData->realcoords[index] = value;
+	tabData->valueset[index] = valid
+			&& (!tabData->logxy[index / 2] || value > 0);
 
 	setButtonSensitivity(tabData);
+	refreshProcessingInformation(tabData);
 }
 
 /****************************************************************/
@@ -1724,6 +1758,8 @@ void checkValuesOnLogarithmicAxis(GtkToggleButton *widget, gpointer data) {
 			gtk_entry_set_text(GTK_ENTRY(tabData->xyentry[index*2+1]), ""); /* Zero it */
 		}
 	}
+	setButtonSensitivity(tabData);
+	refreshProcessingInformation(tabData);
 }
 
 /****************************************************************/
@@ -1754,6 +1790,7 @@ void removeLastPoint(GtkWidget *widget, gpointer data) {
 	triggerUpdateDrawArea(tabData->drawing_area);
 
 	setButtonSensitivity(tabData);
+	refreshProcessingInformation(tabData);
 }
 
 /****************************************************************/
@@ -2076,11 +2113,12 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	GtkWidget *trvbox, *tlvbox, *brvbox, *blvbox, *subvbox;
 	GtkWidget *xy_label[4]; /* Labels for texts in window */
 	GtkWidget *logcheckb[2]; /* Logarithmic checkbuttons */
-	GtkWidget *nump_label, *ScrollWindow; /* Various widgets */
+	GtkWidget *nump_label, *ScrollWindow, *controls_scroll; /* Various widgets */
 	GtkWidget *APlabel, *PIlabel, *ZAlabel, *Llabel, *tab_label;
 	GtkWidget *alignment, *fixed;
 	GtkWidget *x_label, *y_label, *tmplabel;
-	GtkWidget *ordercheckb[3], *UseErrCheckB, *actioncheckb[2];
+	GtkWidget *ordercheckb[ORDERBNUM], *UseErrCheckB,
+			*actioncheckb[ACTIONBNUM];
 	GtkWidget *Olabel, *Elabel, *Alabel;
 	GSList *group;
 	GtkWidget *dialog;
@@ -2159,6 +2197,7 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	tabData->numpoints = 0;
 	tabData->numlastpoints = 0;
 	tabData->ordering = 0;
+	tabData->Action = PRINT2STDOUT;
 
 	tabData->mousePointerCoords[0] = -1.0;
 	tabData->mousePointerCoords[1] = -1.0;
@@ -2355,7 +2394,14 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 			0);
 
 	blvbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, GROUP_SEP);
-	gtk_box_pack_start(GTK_BOX (bottomhbox), blvbox, FALSE, FALSE, ELEM_SEP);
+	controls_scroll = gtk_scrolled_window_new(NULL, NULL);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(controls_scroll),
+			GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+	gtk_widget_set_vexpand(controls_scroll, TRUE);
+	gtk_widget_set_valign(controls_scroll, GTK_ALIGN_FILL);
+	gtk_box_pack_start(GTK_BOX(bottomhbox), controls_scroll, FALSE, TRUE,
+			ELEM_SEP);
+	gtk_container_add(GTK_CONTAINER(controls_scroll), blvbox);
 
 	subvbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, ELEM_SEP);
 	gtk_box_pack_start(GTK_BOX (blvbox), subvbox, FALSE, FALSE, 0);

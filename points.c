@@ -137,25 +137,19 @@ struct PointValue calculatePointValue(gdouble Xpos, gdouble Ypos,
 /****************************************************************/
 void outputResultset(GtkWidget *widget, gpointer data) {
 	gint i; /* Declare index variable */
-	gboolean print2file;
 	FILE *FP;
+	GtkClipboard *clipboard;
+	GString *output;
 	struct TabData *tabData;
 	struct PointValue *realPositions, calculatedValue;
 
 	tabData = (struct TabData *) data;
-
-	print2file = tabData->Action;
-
-	if (print2file == PRINT2FILE) {
-		FP = fopen(tabData->file_name, "w"); /* Open file for writing */
-		if (FP == NULL) {
-			printf("Could not open %s for writing\n", tabData->file_name); /* If unable to open print error */
-			return;
-		}
-	}
+	(void) widget;
 
 	realPositions = (struct PointValue *) malloc(
 			sizeof(struct PointValue) * tabData->numpoints);
+	if (realPositions == NULL)
+		return;
 
 	/* Next up is recalculating the positions of the points by solving a 2*2 matrix */
 
@@ -172,26 +166,38 @@ void outputResultset(GtkWidget *widget, gpointer data) {
 		orderPoints(realPositions, 0, tabData->numpoints - 1, tabData->ordering);
 	}
 
-	/* Print results to stdout or file */
+	/* Format once so stdout, files and the clipboard contain identical data. */
+	output = g_string_new(NULL);
 
 	for (i = 0; i < tabData->numpoints; i++) {
-		if (print2file == PRINT2FILE) {
-			fprintf(FP, "%.12g  %.12g", realPositions[i].Xv, realPositions[i].Yv);
-			if (tabData->UseErrors) {
-				fprintf(FP, "\t%.12g  %.12g\n", realPositions[i].Xerr,
-						realPositions[i].Yerr);
-			} else
-				fprintf(FP, "\n");
-		} else {
-			printf("%.12g  %.12g", realPositions[i].Xv, realPositions[i].Yv);
-			if (tabData->UseErrors) {
-				printf("\t%.12g  %.12g\n", realPositions[i].Xerr, realPositions[i].Yerr);
-			} else
-				printf("\n");
-		}
+		g_string_append_printf(output, "%.12g  %.12g", realPositions[i].Xv,
+				realPositions[i].Yv);
+		if (tabData->UseErrors)
+			g_string_append_printf(output, "\t%.12g  %.12g", realPositions[i].Xerr,
+					realPositions[i].Yerr);
+		g_string_append_c(output, '\n');
 	}
 	free(realPositions);
 
-	if (print2file == PRINT2FILE)
+	switch (tabData->Action) {
+	case PRINT2FILE:
+		FP = fopen(tabData->file_name, "w");
+		if (FP == NULL) {
+			printf("Could not open %s for writing\n", tabData->file_name);
+			break;
+		}
+		fputs(output->str, FP);
 		fclose(FP);
+		break;
+	case COPY2CLIPBOARD:
+		clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+		gtk_clipboard_set_text(clipboard, output->str, output->len);
+		break;
+	case PRINT2STDOUT:
+	default:
+		fputs(output->str, stdout);
+		break;
+	}
+
+	g_string_free(output, TRUE);
 }
