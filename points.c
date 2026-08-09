@@ -130,32 +130,28 @@ struct PointValue calculatePointValue(gdouble Xpos, gdouble Ypos,
 	return pointValue;
 }
 
-/****************************************************************/
-/* This function is called when the "Print results" button is	*/
-/* pressed, it calculate the values of the datapoints and 	*/
-/* prints them through stdout.					*/
-/****************************************************************/
-void outputResultset(GtkWidget *widget, gpointer data) {
-	gint i; /* Declare index variable */
-	FILE *FP;
-	GtkClipboard *clipboard;
-	GString *output;
-	struct TabData *tabData;
+static gboolean appendSeries(GString *output, struct TabData *tabData,
+		DataSeries *series, gboolean include_label, gboolean tab_separated) {
+	gint i;
+	gint point_count;
 	struct PointValue *realPositions, calculatedValue;
 
-	tabData = (struct TabData *) data;
-	(void) widget;
+	if (series == NULL || series->points->len == 0)
+		return FALSE;
+	point_count = (gint) series->points->len;
 
 	realPositions = (struct PointValue *) malloc(
-			sizeof(struct PointValue) * tabData->numpoints);
+			sizeof(struct PointValue) * point_count);
 	if (realPositions == NULL)
-		return;
+		return FALSE;
 
 	/* Next up is recalculating the positions of the points by solving a 2*2 matrix */
 
-	for (i = 0; i < tabData->numpoints; i++) {
-		calculatedValue = calculatePointValue(tabData->points[i][0],
-				tabData->points[i][1], tabData);
+	for (i = 0; i < point_count; i++) {
+		SamplePoint *point;
+		point = g_ptr_array_index(series->points, i);
+		calculatedValue = calculatePointValue(point->source_x_px,
+				point->source_y_px, tabData);
 		realPositions[i].Xv = calculatedValue.Xv;
 		realPositions[i].Yv = calculatedValue.Yv;
 		realPositions[i].Xerr = calculatedValue.Xerr;
@@ -163,41 +159,61 @@ void outputResultset(GtkWidget *widget, gpointer data) {
 	}
 
 	if (tabData->ordering != 0) {
-		orderPoints(realPositions, 0, tabData->numpoints - 1, tabData->ordering);
+		orderPoints(realPositions, 0, point_count - 1, tabData->ordering);
 	}
 
-	/* Format once so stdout, files and the clipboard contain identical data. */
-	output = g_string_new(NULL);
+	if (include_label) {
+		gchar *safe_label;
+		safe_label = g_strdup(series->label);
+		g_strdelimit(safe_label, "\r\n", ' ');
+		g_string_append_printf(output, "# %s\n", safe_label);
+		g_free(safe_label);
+	}
 
-	for (i = 0; i < tabData->numpoints; i++) {
-		g_string_append_printf(output, "%.12g  %.12g", realPositions[i].Xv,
-				realPositions[i].Yv);
-		if (tabData->UseErrors)
-			g_string_append_printf(output, "\t%.12g  %.12g", realPositions[i].Xerr,
-					realPositions[i].Yerr);
+	for (i = 0; i < point_count; i++) {
+		if (tab_separated) {
+			g_string_append_printf(output, "%.12g\t%.12g", realPositions[i].Xv,
+					realPositions[i].Yv);
+			if (tabData->UseErrors)
+				g_string_append_printf(output, "\t%.12g\t%.12g",
+						realPositions[i].Xerr, realPositions[i].Yerr);
+		} else {
+			g_string_append_printf(output, "%.12g  %.12g", realPositions[i].Xv,
+					realPositions[i].Yv);
+			if (tabData->UseErrors)
+				g_string_append_printf(output, "\t%.12g  %.12g",
+						realPositions[i].Xerr, realPositions[i].Yerr);
+		}
 		g_string_append_c(output, '\n');
 	}
 	free(realPositions);
+	return TRUE;
+}
 
-	switch (tabData->Action) {
-	case PRINT2FILE:
-		FP = fopen(tabData->file_name, "w");
-		if (FP == NULL) {
-			printf("Could not open %s for writing\n", tabData->file_name);
-			break;
+GString *formatResultset(struct TabData *tabData, gboolean all_series,
+		gboolean tab_separated) {
+	GString *output;
+	gboolean appended;
+	guint i;
+
+	if (tabData == NULL || tabData->document == NULL)
+		return NULL;
+	output = g_string_new(NULL);
+	appended = FALSE;
+	if (all_series) {
+		for (i = 0; i < tabData->document->series->len; i++) {
+			DataSeries *series;
+			series = g_ptr_array_index(tabData->document->series, i);
+			if (appendSeries(output, tabData, series, TRUE, tab_separated))
+				appended = TRUE;
 		}
-		fputs(output->str, FP);
-		fclose(FP);
-		break;
-	case COPY2CLIPBOARD:
-		clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-		gtk_clipboard_set_text(clipboard, output->str, output->len);
-		break;
-	case PRINT2STDOUT:
-	default:
-		fputs(output->str, stdout);
-		break;
+	} else {
+		appended = appendSeries(output, tabData,
+				tabData->document->active_series, FALSE, tab_separated);
 	}
-
-	g_string_free(output, TRUE);
+	if (!appended) {
+		g_string_free(output, TRUE);
+		return NULL;
+	}
+	return output;
 }

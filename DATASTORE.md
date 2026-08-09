@@ -5,8 +5,10 @@ number-sections: true
 
 # Purpose {#sec:purpose}
 
-This document proposes a persistent data model and user interface for G3Data2.
-It is a design, not an implementation. The intended result is that:
+This document describes the persistent data model and user interface for
+G3Data2. The recommended first release described below is implemented on the
+`datastore` branch; later extensions remain identified as such. The result is
+that:
 
 - calibration and sampled points survive tab closure and application exit;
 - reopening the same image restores its data even if the file was moved;
@@ -20,9 +22,9 @@ pixel coordinate system and stores the calibration inputs, never the calculated
 X/Y values. Changing the calibration therefore changes every displayed or
 exported X/Y value without rewriting the sampled points.
 
-# Current implementation {#sec:current}
+# Previous implementation {#sec:current}
 
-All document state currently lives in `struct TabData`:
+Before the datastore work, all document state lived in `struct TabData`:
 
 - four calibration marker positions in `axiscoords[4][2]`;
 - four calibration values in `realcoords[4]`;
@@ -345,12 +347,6 @@ An indicative layout is:
 |   Mode   (● Add) (○ Select/edit) |                              |
 |   Selected: Curve A, point 7     |                              |
 |   X 12.34   Y 56.78              |                              |
-|   [Delete selected]              |                              |
-|                                  |                              |
-| Export                           |                              |
-|   Scope  [Active series      ▾]  |                              |
-|   Target [Clipboard          ▾]  |                              |
-|   [Export point data]            |                              |
 +----------------------------------+------------------------------+
 ```
 
@@ -365,8 +361,9 @@ The interaction modes should be explicit:
 - **Add mode:** a normal click adds a point to the active series. Calibration
   placement buttons temporarily override this mode as they do now.
 - **Select/edit mode:** clicking near a visible marker selects it; dragging
-  moves it; `Delete` or **Delete selected** removes it. `Shift`-click may extend
-  to multi-selection later.
+  moves it. `Shift`-click adds or removes markers from a multi-point selection.
+  `Delete`, Backspace, or **Edit** → **Delete selected point(s)** removes the
+  selection.
 
 An explicit mode is easier to discover than relying only on the current
 hold-Control-to-move behaviour. Keyboard shortcuts such as `A` for Add, `S` for
@@ -377,6 +374,10 @@ point feels the same at every zoom level. Search the active series first, then
 other visible series from front to back. If markers overlap, repeated clicks or
 a small chooser can cycle through candidates.
 
+Newly opened images use a sticky **Zoom to fit** view. Window-size changes
+recalculate that fit until the user manually zooms or pans, or selects a fixed
+zoom level.
+
 All visible series are drawn in their stored colours. Active-series markers are
 fully opaque; inactive series may be slightly muted. A hovered point gets a
 thin halo, and the selected point gets a larger high-contrast double halo that
@@ -386,34 +387,39 @@ coordinates. Those calculated values refresh whenever the calibration changes.
 
 The existing removal semantics should become less surprising:
 
-- **Remove last point** removes the highest `sample_order` in the active series;
-- **Remove all points** becomes **Clear active series** and asks for
-  confirmation; and
+- **Edit** → **Remove last point** removes the highest `sample_order` in the
+  current series;
+- **Edit** → **Clear current series** asks for confirmation; and
 - clearing calibration is a separate action, not the second effect of clicking
   **Remove all points** twice.
 
 # Export behaviour {#sec:export}
 
-The first multi-series release should export the active series only. This
-preserves the current headerless numeric format and makes file, stdout, and
-clipboard behaviour predictable.
+The **File** menu provides separate **Export current series** and **Export all
+series** submenus. Each scope can be written to stdout, saved through a file
+chooser, or copied to the clipboard. Current-series file and stdout output
+retains the existing headerless two- or four-column numeric format.
+Point ordering and inclusion of value-error columns are persistent check/radio
+options in the **File** menu and apply to every export destination.
 
-The UI should nevertheless include an export-scope selector designed for these
-later choices:
+All-series output uses the same numeric records with a comment line before each
+non-empty series:
 
-- **Active series**: current numeric format, with optional error columns;
-- **All visible series**: combined long-form CSV with columns `series`, `x`,
-  `y`, and optional `x_error`, `y_error`; and
-- **Each series to a separate file**: file output only, with sanitized labels in
-  filenames.
+```text
+# Curve A
+1.2  3.4
+2.3  4.5
+# Curve B
+5.6  7.8
+```
 
-Long-form CSV is preferable to inventing comment separators inside the existing
-numeric format. It handles series of different lengths and permits labels to be
-quoted correctly. The active-series default avoids breaking scripts that expect
-two or four numeric columns.
+Clipboard output uses tabs between every numeric field and newlines between
+records. This makes the plain-text clipboard representation paste directly as
+rows and columns in spreadsheet applications such as LibreOffice Calc. Series
+comment lines occupy a single cell when all-series output is pasted.
 
-Ordering is applied independently within each series at export time. As now,
-the exporter calculates every point from its stored image position and the
+Ordering is applied independently within each series at export time. The
+exporter calculates every point from its stored source-image position and the
 current calibration immediately before formatting.
 
 # Failure cases and policy decisions {#sec:failure}
@@ -458,8 +464,8 @@ The feature is safest as a sequence of independently testable changes.
 5. **Visual point editing.** Add screen-space hit testing, hover and selected
    states, the point inspector, drag persistence on release, and deletion by
    stable point ID.
-6. **Export scope.** Keep active-series export as the default, then add combined
-   CSV and separate-file options if desired.
+6. **Export scope.** Provide current- and all-series actions through the File
+   menu; label each series with a comment line in combined output.
 7. **Recovery and polish.** Add database-error status, retry, optional project
    database selection, database snapshot/export, and external-change detection.
 

@@ -23,6 +23,7 @@ Authors email : jonas@frantz.fi
 
  */
 #include <gtk/gtk.h>					/* Include gtk library */
+#include "model.h"
 
 #define VERSION "1.0.0"					/* Version number */
 
@@ -31,25 +32,22 @@ Authors email : jonas@frantz.fi
 #define MARKERSIZE 3					/* Size of point marker red outer square */
 #define MARKERLENGTH 6					/* Axis marker length */
 #define MARKERTHICKNESS 2				/* Marker line thickness */
-#define MAXPOINTS 64					/* Number of points to allocate at once */
 #define MAXNUMFILES 256
 #define GRABTRESHOLD MARKERSIZE*2
 
-#define ACTIONBNUM 3
 #define ORDERBNUM 3
 #define LOGBNUM 2
 
-#define NONESELECTED -1
-
 #define URI_IDENTIFIER "file://"
+
+struct TabData;
 
 struct PointValue {
 	double Xv, Yv, Xerr, Yerr;
 };
 
-typedef enum {
-	PRINT2STDOUT = 0, PRINT2FILE, COPY2CLIPBOARD
-} ACTION;
+GString *formatResultset(struct TabData *tabData, gboolean all_series,
+		gboolean tab_separated);
 
 typedef enum {
 	URI_LIST, DROP_TARGET_NUM_DEFS
@@ -59,37 +57,36 @@ struct TabData {
 	GtkWidget *drawing_area;
 	GtkWidget *zoom_area; 					// Drawing areas
 	GtkWidget *xyentry[4];
-	GtkWidget *exportbutton;
-	GtkWidget *remlastbutton; 				// Various buttons
 	GtkWidget *setxybutton[4];
-	GtkWidget *remallbutton; 				// Even more various buttons
+	GtkWidget *logcheckbutton[2];
 	GtkWidget *xc_entry, *yc_entry;
-	GtkWidget *file_entry, *nump_entry;
+	GtkWidget *nump_entry;
 	GtkWidget *xerr_entry, *yerr_entry; 	// Coordinate and filename entries
 	GtkWidget *logbox;
 	GtkWidget *zoomareabox;
-	GtkWidget *oppropbox;
 	GtkWidget *ViewPort;
+	GtkWidget *series_combo;
+	GtkWidget *series_label_entry;
+	GtkWidget *series_color_button;
+	GtkWidget *series_visible_check;
+	GtkWidget *delete_series_button;
+	GtkWidget *edit_mode_button;
+	GtkWidget *selected_point_label;
 
 	cairo_surface_t *image;
 
 	gdouble axiscoords[4][2]; 				// X,Y coordinates of axispoints
-	gdouble **points; 						// Indexes of graphpoints and their coordinates
-	gint *lastpoints; 						// Indexes of last points put out
 	gint numpoints;
-	gint numlastpoints; 					// Number of points on graph and last put out
 	gint ordering; 							// Various control variables
 	gint XSize, YSize;
-	gint file_name_length;
-	gint MaxPoints; // = MAXPOINTS;
-	gint Action;
+	gint sourceXSize, sourceYSize;
+	gdouble imageScale;
 	gdouble realcoords[4]; 					// X,Y coords on graph
 	gboolean UseErrors;
 	gboolean setxypressed[4];
 	gboolean bpressed[4]; 					// What axispoints have been set out ?
 	gboolean valueset[4];
 	gboolean logxy[2]; // = { FALSE, FALSE };
-	gchar *file_name; 						// Pointer to filename
 	gchar FileNames[256];
 
 	gdouble mousePointerCoords[2];
@@ -97,7 +94,6 @@ struct TabData {
 	gdouble viewOrigin[2];
 	gdouble viewCanvasSize[2];
 
-	gint movedPointIndex;
 	gdouble movedOrigCoords[2];
 	gdouble movedOrigMousePtrCoords[2];
 
@@ -105,11 +101,19 @@ struct TabData {
 	gboolean middlePanMoved;
 	gdouble middlePanStartMouse[2];
 	gdouble middlePanStartAdj[2];
-	gboolean pendingInitialZoomToFit;
+	gboolean zoomedToFit;
+	gint fittedViewportWidth;
+	gint fittedViewportHeight;
 	gboolean pendingRecenterOnAdjust;
 	gboolean pendingZoomScrollOnAdjust;
 	gdouble pendingZoomScrollTarget[2];
 	gdouble pendingZoomScrollCanvasSize[2];
+
+	ImageDocument *document;
+	gboolean loadingStore;
+	gboolean editMode;
+	SamplePoint *movedPoint;
+	DataSeries *movedSeries;
 };
 
 struct ButtonData {

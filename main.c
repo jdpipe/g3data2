@@ -32,6 +32,7 @@
 #include <glib/gstdio.h>
 #include <libgen.h>
 #include "main.h"									/* Include predefined variables */
+#include "datastore.h"
 #include "strings.h"								/* Include strings */
 #include "vardefs.h"
 
@@ -52,7 +53,8 @@
 // This is the name we will attach the data structure to the container with
 static const char *DATA_STORE_NAME = "tabdatastruct";
 static const gdouble MAIN_IMAGE_MIN_ZOOM = 0.05;
-static const gdouble MAIN_IMAGE_MAX_ZOOM = 8.0;
+static const gdouble MAIN_IMAGE_MAX_ZOOM = 16.0;
+static const gdouble MAIN_IMAGE_MAX_CANVAS_DIMENSION = 30000.0;
 static const gdouble MAIN_IMAGE_ZOOM_STEP = 1.25;
 static const gdouble ZOOM_AREA_VIEW_MULTIPLIER = 2.0;
 static const gdouble MAIN_IMAGE_CANVAS_MIN_PAD = 512.0;
@@ -65,6 +67,9 @@ static const gint START_TILE_MAX_ITEM_W = 220;
 static const char *RECENT_GROUP = "RecentFiles";
 static const char *RECENT_PATH_KEY_FMT = "path_%d";
 static const char *RECENT_DATE_KEY_FMT = "date_%d";
+static const char *EXPORT_PREF_GROUP = "Export";
+static const char *EXPORT_ORDERING_KEY = "ordering";
+static const char *EXPORT_ERRORS_KEY = "include_errors";
 
 static const char *DROPPED_URI_DELIMITER = "\r\n";
 
@@ -77,6 +82,17 @@ static const char *DROPPED_URI_DELIMITER = "\r\n";
 static void setButtonSensitivity(struct TabData *tabData);
 static void triggerUpdateDrawArea(GtkWidget *area);
 static void refreshProcessingInformation(struct TabData *tabData);
+static void refreshSeriesWidgets(struct TabData *tabData);
+static void persistCalibration(struct TabData *tabData);
+static void deleteSelectedPoint(GtkWidget *widget, gpointer data);
+static gboolean calibrationIsComplete(const struct TabData *tabData);
+static void updateExportMenuSensitivity(struct TabData *tabData);
+static void updateEditMenuSensitivity(struct TabData *tabData);
+static void exportFromMenu(GtkWidget *widget, gpointer data);
+static void exportOrderingChanged(GtkCheckMenuItem *widget, gpointer data);
+static void exportErrorsChanged(GtkCheckMenuItem *widget, gpointer data);
+static struct TabData *getCurrentTabData(void);
+void setNumberOfPointsEntryValue(GtkWidget *np_entry, gint np);
 gint setupNewTab(char *filename, gdouble Scale, gdouble maxX,
 		gdouble maxY, gboolean UsePreSetCoords, gdouble *TempCoords,
 		gboolean *Uselogxy, gboolean *UseError);
@@ -88,6 +104,11 @@ GtkWidget *close_menu_item;
 GtkWidget *file_menu_widget;
 GtkWidget *start_page_widget;
 GtkWidget *start_icon_view_widget;
+GtkWidget *export_current_menu_item;
+GtkWidget *export_all_menu_item;
+GtkWidget *remove_last_menu_item;
+GtkWidget *clear_series_menu_item;
+GtkWidget *delete_selected_menu_item;
 
 struct RecentFileEntry {
 	gchar *path;
@@ -99,13 +120,24 @@ GPtrArray *recent_menu_items;
 
 // Declaration of global variables
 gboolean MovePointMode = FALSE;
-gboolean HideLog = FALSE, HideZoomArea = FALSE, HideOpProp = FALSE;
+gboolean HideLog = FALSE, HideZoomArea = FALSE;
+static gint exportOrdering = 0;
+static gboolean exportUseErrors = FALSE;
 
 // Declaration of extern functions
 extern void drawMarker(cairo_t *cr, gint x, gint y, gint type);
+extern void drawSeriesMarker(cairo_t *cr, gdouble x, gdouble y, guint32 rgba,
+		gboolean active, gboolean hovered, gboolean selected);
 extern struct PointValue calculatePointValue(gdouble Xpos, gdouble Ypos,
 		struct TabData *tabData);
-extern void outputResultset(GtkWidget *widget, gpointer func_data);
+static Datastore *appDatastore = NULL;
+
+typedef enum {
+	EXPORT_TO_STDOUT = 0,
+	EXPORT_TO_FILE,
+	EXPORT_TO_CLIPBOARD,
+	EXPORT_TARGET_COUNT
+} ExportTarget;
 
 static void debugDumpViewportState(const char *tag, struct TabData *tabData) {
 #ifdef G3DATA2_DEBUG
@@ -137,11 +169,11 @@ static void debugDumpViewportState(const char *tag, struct TabData *tabData) {
 			gtk_widget_get_allocated_height(tabData->drawing_area) : -1;
 
 	G3DBG(
-			"%s: vp_alloc=%dx%d da_alloc=%dx%d hadj[v=%.2f lo=%.2f up=%.2f page=%.2f] vadj[v=%.2f lo=%.2f up=%.2f page=%.2f] zoom=%.6f origin=(%.2f,%.2f) canvas=(%.2f,%.2f) image=%dx%d pending_fit=%d\n",
+			"%s: vp_alloc=%dx%d da_alloc=%dx%d hadj[v=%.2f lo=%.2f up=%.2f page=%.2f] vadj[v=%.2f lo=%.2f up=%.2f page=%.2f] zoom=%.6f origin=(%.2f,%.2f) canvas=(%.2f,%.2f) image=%dx%d zoom_to_fit=%d\n",
 			tag, vpW, vpH, daW, daH, hVal, hLower, hUpper, hPage, vVal, vLower, vUpper,
 			vPage, tabData->viewZoom, tabData->viewOrigin[0], tabData->viewOrigin[1],
 			tabData->viewCanvasSize[0], tabData->viewCanvasSize[1], tabData->XSize,
-			tabData->YSize, tabData->pendingInitialZoomToFit);
+			tabData->YSize, tabData->zoomedToFit);
 #else
 	(void) tag;
 	(void) tabData;
@@ -170,6 +202,73 @@ static void freeRecentFileEntry(gpointer data) {
 static gchar *getRecentFilesPath(void) {
 	return g_build_filename(g_get_user_config_dir(), "g3data3",
 			"recent-files.ini", NULL);
+}
+
+static gchar *getExportPreferencesPath(void) {
+	return g_build_filename(g_get_user_config_dir(), "g3data2",
+			"preferences.ini", NULL);
+}
+
+static void loadExportPreferences(void) {
+	GKeyFile *key_file;
+	GError *error;
+	gchar *path;
+	gint ordering;
+
+	key_file = g_key_file_new();
+	path = getExportPreferencesPath();
+	error = NULL;
+	if (!g_key_file_load_from_file(key_file, path, G_KEY_FILE_NONE, &error)) {
+		g_clear_error(&error);
+		g_free(path);
+		g_key_file_unref(key_file);
+		return;
+	}
+
+	error = NULL;
+	ordering = g_key_file_get_integer(key_file, EXPORT_PREF_GROUP,
+			EXPORT_ORDERING_KEY, &error);
+	if (error == NULL && ordering >= 0 && ordering < ORDERBNUM)
+		exportOrdering = ordering;
+	g_clear_error(&error);
+
+	error = NULL;
+	exportUseErrors = g_key_file_get_boolean(key_file, EXPORT_PREF_GROUP,
+			EXPORT_ERRORS_KEY, &error);
+	if (error != NULL) {
+		exportUseErrors = FALSE;
+		g_clear_error(&error);
+	}
+
+	g_free(path);
+	g_key_file_unref(key_file);
+}
+
+static void saveExportPreferences(void) {
+	GKeyFile *key_file;
+	GError *error;
+	gchar *path, *dirpath, *contents;
+	gsize length;
+
+	key_file = g_key_file_new();
+	g_key_file_set_integer(key_file, EXPORT_PREF_GROUP, EXPORT_ORDERING_KEY,
+			exportOrdering);
+	g_key_file_set_boolean(key_file, EXPORT_PREF_GROUP, EXPORT_ERRORS_KEY,
+			exportUseErrors);
+	contents = g_key_file_to_data(key_file, &length, NULL);
+	path = getExportPreferencesPath();
+	dirpath = g_path_get_dirname(path);
+	g_mkdir_with_parents(dirpath, 0755);
+	error = NULL;
+	if (!g_file_set_contents(path, contents, length, &error)) {
+		g_warning("Could not save export preferences: %s", error->message);
+		g_error_free(error);
+	}
+
+	g_free(dirpath);
+	g_free(path);
+	g_free(contents);
+	g_key_file_unref(key_file);
 }
 
 static gchar *getNowIsoTimestamp(void) {
@@ -416,6 +515,7 @@ static void showStartPageIfNeeded(void) {
 	gtk_widget_show_all(start_page_widget);
 	gtk_widget_hide(mainnotebook);
 	gtk_widget_set_sensitive(close_menu_item, FALSE);
+	updateEditMenuSensitivity(NULL);
 	gtk_window_set_title(GTK_WINDOW(window), Window_Title_NoneOpen);
 }
 
@@ -632,9 +732,9 @@ gboolean updateZoomArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 		cairo_set_source_surface(
 				first_cr,
 				tabData->image,
-				-tabData->mousePointerCoords[0]
+				-tabData->mousePointerCoords[0] * tabData->imageScale
 						+ ZOOMPIXSIZE / (2 * zoomAreaScale),
-				-tabData->mousePointerCoords[1]
+				-tabData->mousePointerCoords[1] * tabData->imageScale
 						+ ZOOMPIXSIZE / (2 * zoomAreaScale));
 		cairo_paint(first_cr);
 		cairo_scale(first_cr, 1.0 / zoomAreaScale, 1.0 / zoomAreaScale);
@@ -652,11 +752,28 @@ gboolean updateZoomArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 	return TRUE;
 }
 
-static gdouble clampZoom(gdouble zoom) {
+static gdouble maximumZoomForImage(const struct TabData *tabData) {
+	gdouble largest_dimension, canvas_limited_zoom;
+
+	if (tabData == NULL)
+		return MAIN_IMAGE_MAX_ZOOM;
+	largest_dimension = MAX(tabData->XSize, tabData->YSize);
+	if (largest_dimension <= 0.0)
+		return MAIN_IMAGE_MAX_ZOOM;
+	canvas_limited_zoom = (MAIN_IMAGE_MAX_CANVAS_DIMENSION
+			- 2.0 * MAIN_IMAGE_CANVAS_MIN_PAD) / largest_dimension;
+	return CLAMP(canvas_limited_zoom, MAIN_IMAGE_MIN_ZOOM,
+			MAIN_IMAGE_MAX_ZOOM);
+}
+
+static gdouble clampZoom(const struct TabData *tabData, gdouble zoom) {
+	gdouble maximum_zoom;
+
+	maximum_zoom = maximumZoomForImage(tabData);
 	if (zoom < MAIN_IMAGE_MIN_ZOOM)
 		return MAIN_IMAGE_MIN_ZOOM;
-	if (zoom > MAIN_IMAGE_MAX_ZOOM)
-		return MAIN_IMAGE_MAX_ZOOM;
+	if (zoom > maximum_zoom)
+		return maximum_zoom;
 	return zoom;
 }
 
@@ -773,7 +890,7 @@ static void setMainImageZoom(struct TabData *tabData, gdouble newZoom,
 	gdouble newCanvasW, newCanvasH;
 	gint newWidth, newHeight;
 
-	newZoom = clampZoom(newZoom);
+	newZoom = clampZoom(tabData, newZoom);
 	oldZoom = tabData->viewZoom;
 	oldOriginX = tabData->viewOrigin[0];
 	oldOriginY = tabData->viewOrigin[1];
@@ -855,7 +972,7 @@ static gdouble calculateZoomToFit(struct TabData *tabData) {
 
 	fitX = pageW / tabData->XSize;
 	fitY = pageH / tabData->YSize;
-	return clampZoom(MIN(fitX, fitY));
+	return clampZoom(tabData, MIN(fitX, fitY));
 }
 
 static void centerImageInView(struct TabData *tabData) {
@@ -943,20 +1060,37 @@ static void zoomToFitAndCenter(struct TabData *tabData) {
 	debugDumpViewportState("zoomToFitAndCenter:end", tabData);
 }
 
-static void maybeApplyInitialZoomToFit(struct TabData *tabData) {
-	if (tabData == NULL || !tabData->pendingInitialZoomToFit
+static void disableZoomToFit(struct TabData *tabData) {
+	if (tabData == NULL)
+		return;
+	tabData->zoomedToFit = FALSE;
+	tabData->fittedViewportWidth = -1;
+	tabData->fittedViewportHeight = -1;
+	tabData->pendingZoomScrollOnAdjust = FALSE;
+	tabData->pendingRecenterOnAdjust = FALSE;
+}
+
+static void applyStickyZoomToFit(struct TabData *tabData, gboolean force) {
+	gint viewport_width, viewport_height;
+
+	if (tabData == NULL || !tabData->zoomedToFit
 			|| tabData->drawing_area == NULL || tabData->ViewPort == NULL)
 		return;
 	if (tabData->XSize <= 0 || tabData->YSize <= 0)
 		return;
-	if (gtk_widget_get_allocated_width(tabData->ViewPort) <= 1
-			|| gtk_widget_get_allocated_height(tabData->ViewPort) <= 1)
+	viewport_width = gtk_widget_get_allocated_width(tabData->ViewPort);
+	viewport_height = gtk_widget_get_allocated_height(tabData->ViewPort);
+	if (viewport_width <= 1 || viewport_height <= 1)
+		return;
+	if (!force && viewport_width == tabData->fittedViewportWidth
+			&& viewport_height == tabData->fittedViewportHeight)
 		return;
 
-	debugDumpViewportState("maybeApplyInitialZoomToFit:ready", tabData);
+	tabData->fittedViewportWidth = viewport_width;
+	tabData->fittedViewportHeight = viewport_height;
+	debugDumpViewportState("applyStickyZoomToFit:ready", tabData);
 	zoomToFitAndCenter(tabData);
-	tabData->pendingInitialZoomToFit = FALSE;
-	debugDumpViewportState("maybeApplyInitialZoomToFit:done", tabData);
+	debugDumpViewportState("applyStickyZoomToFit:done", tabData);
 }
 
 static gboolean applyInitialZoomToFit(gpointer data) {
@@ -964,7 +1098,7 @@ static gboolean applyInitialZoomToFit(gpointer data) {
 
 	tabData = (struct TabData *) data;
 	debugDumpViewportState("applyInitialZoomToFit", tabData);
-	maybeApplyInitialZoomToFit(tabData);
+	applyStickyZoomToFit(tabData, FALSE);
 	return G_SOURCE_REMOVE;
 }
 
@@ -973,7 +1107,7 @@ static void viewportSizeAllocateEvent(GtkWidget *widget, GtkAllocation *allocati
 	(void) widget;
 	G3DBG("viewportSizeAllocateEvent: alloc=%dx%d\n", allocation->width,
 			allocation->height);
-	maybeApplyInitialZoomToFit((struct TabData *) data);
+	applyStickyZoomToFit((struct TabData *) data, FALSE);
 	maybeApplyPendingZoomScroll((struct TabData *) data);
 	maybeApplyPendingRecenter((struct TabData *) data);
 }
@@ -982,8 +1116,12 @@ static void getImageCoords(struct TabData *tabData, gdouble widgetX,
 		gdouble widgetY, gdouble *imageX, gdouble *imageY) {
 	if (tabData->viewZoom <= 0)
 		tabData->viewZoom = 1.0;
-	*imageX = (widgetX - tabData->viewOrigin[0]) / tabData->viewZoom;
-	*imageY = (widgetY - tabData->viewOrigin[1]) / tabData->viewZoom;
+	if (tabData->imageScale <= 0)
+		tabData->imageScale = 1.0;
+	*imageX = (widgetX - tabData->viewOrigin[0])
+			/ (tabData->viewZoom * tabData->imageScale);
+	*imageY = (widgetY - tabData->viewOrigin[1])
+			/ (tabData->viewZoom * tabData->imageScale);
 }
 
 static GtkWidget *g3TableNew(guint rows, guint columns, gboolean homogeneous) {
@@ -1067,13 +1205,12 @@ static void applyMiddleButtonAxisShortcut(struct TabData *tabData, gdouble image
 			tabData->bpressed[i] = TRUE;
 			gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tabData->setxybutton[i]),
 					FALSE);
-			tabData->lastpoints[tabData->numlastpoints] = -(i + 1);
-			tabData->numlastpoints++;
 			setButtonSensitivity(tabData);
 			triggerUpdateDrawArea(tabData->drawing_area);
 			tabData->mousePointerCoords[0] = imageX;
 			tabData->mousePointerCoords[1] = imageY;
 			refreshProcessingInformation(tabData);
+			persistCalibration(tabData);
 			break;
 		}
 	}
@@ -1081,6 +1218,7 @@ static void applyMiddleButtonAxisShortcut(struct TabData *tabData, gdouble image
 
 gboolean updateImageArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 	gint i;
+	guint series_index, point_index;
 	struct TabData *tabData;
 
 	tabData = (struct TabData *) data;
@@ -1100,17 +1238,33 @@ gboolean updateImageArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 
 	for (i = 0; i < 4; i++) {
 		if (tabData->bpressed[i]) {
-			drawMarker(cr, (gint) (tabData->axiscoords[i][0]
+			drawMarker(cr, (gint) (tabData->axiscoords[i][0] * tabData->imageScale
 					* tabData->viewZoom + tabData->viewOrigin[0]), (gint) (tabData->axiscoords[i][1]
-					* tabData->viewZoom + tabData->viewOrigin[1]), i / 2);
+					* tabData->imageScale * tabData->viewZoom + tabData->viewOrigin[1]), i / 2);
 		}
 	}
 
-	for (i = 0; i < tabData->numpoints; i++) {
-		drawMarker(cr,
-				(gint) (tabData->points[i][0] * tabData->viewZoom
-						+ tabData->viewOrigin[0]), (gint) (tabData->points[i][1]
-						* tabData->viewZoom + tabData->viewOrigin[1]), 2);
+	if (tabData->document == NULL)
+		return TRUE;
+	for (series_index = 0; series_index < tabData->document->series->len;
+			series_index++) {
+		DataSeries *series;
+		series = g_ptr_array_index(tabData->document->series, series_index);
+		if (!series->visible)
+			continue;
+		for (point_index = 0; point_index < series->points->len; point_index++) {
+			SamplePoint *point;
+			point = g_ptr_array_index(series->points, point_index);
+			drawSeriesMarker(cr,
+					point->source_x_px * tabData->imageScale * tabData->viewZoom
+							+ tabData->viewOrigin[0],
+					point->source_y_px * tabData->imageScale * tabData->viewZoom
+							+ tabData->viewOrigin[1],
+					series->marker_rgba,
+					series == tabData->document->active_series,
+					point == tabData->document->hovered_point,
+					image_document_point_is_selected(tabData->document, point));
+		}
 	}
 
 	return TRUE;
@@ -1120,37 +1274,63 @@ gboolean updateImageArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 /* the control variables.					*/
 /****************************************************************/
 static void setButtonSensitivity(struct TabData *tabData) {
-	char ttbuf[256];
-	gboolean exportReady;
+	updateExportMenuSensitivity(tabData);
+	updateEditMenuSensitivity(tabData);
+}
 
-	exportReady = tabData->valueset[0] && tabData->valueset[1]
-			&& tabData->valueset[2] && tabData->valueset[3]
-			&& tabData->bpressed[0] && tabData->bpressed[1]
-			&& tabData->bpressed[2] && tabData->bpressed[3]
-			&& tabData->numpoints > 0;
+static void reportDatastoreError(const gchar *operation, GError *error) {
+	if (error == NULL)
+		return;
+	g_printerr("Database error while %s: %s\n", operation, error->message);
+	g_error_free(error);
+}
 
-	if (tabData->Action == PRINT2FILE) {
-		snprintf(ttbuf, sizeof(ttbuf), printfilett,
-				gtk_entry_get_text(GTK_ENTRY (tabData->file_entry)));
-		gtk_widget_set_tooltip_text(tabData->exportbutton, ttbuf);
+static DataSeries *activeSeries(struct TabData *tabData) {
+	if (tabData == NULL || tabData->document == NULL)
+		return NULL;
+	return tabData->document->active_series;
+}
 
-		gtk_widget_set_sensitive(tabData->file_entry, TRUE);
-		gtk_widget_set_sensitive(tabData->exportbutton,
-				exportReady && tabData->file_name_length > 0);
-	} else {
-		gtk_widget_set_tooltip_text(tabData->exportbutton,
-				tabData->Action == COPY2CLIPBOARD ? copyclipboardtt : printrestt);
-		gtk_widget_set_sensitive(tabData->file_entry, FALSE);
-		gtk_widget_set_sensitive(tabData->exportbutton, exportReady);
+static void syncActivePointCount(struct TabData *tabData) {
+	DataSeries *series;
+
+	series = activeSeries(tabData);
+	tabData->numpoints = series != NULL ? (gint) series->points->len : 0;
+	if (tabData->nump_entry != NULL)
+		setNumberOfPointsEntryValue(tabData->nump_entry, tabData->numpoints);
+	setButtonSensitivity(tabData);
+}
+
+static void calibrationFromTab(const struct TabData *tabData,
+		CalibrationState *calibration) {
+	gint i;
+
+	calibration_state_clear(calibration);
+	for (i = 0; i < G3_AXIS_POINT_COUNT; i++) {
+		calibration->axis_x[i] = tabData->axiscoords[i][0];
+		calibration->axis_y[i] = tabData->axiscoords[i][1];
+		calibration->axis_value[i] = tabData->realcoords[i];
+		calibration->position_set[i] = tabData->bpressed[i];
+		calibration->value_set[i] = tabData->valueset[i];
 	}
+	calibration->log_axis[0] = tabData->logxy[0];
+	calibration->log_axis[1] = tabData->logxy[1];
+}
 
-	if (tabData->numlastpoints == 0) {
-		gtk_widget_set_sensitive(tabData->remlastbutton, FALSE);
-		gtk_widget_set_sensitive(tabData->remallbutton, FALSE);
-	} else {
-		gtk_widget_set_sensitive(tabData->remlastbutton, TRUE);
-		gtk_widget_set_sensitive(tabData->remallbutton, TRUE);
-	}
+static void persistCalibration(struct TabData *tabData) {
+	CalibrationState calibration;
+	GError *error;
+
+	if (tabData == NULL || tabData->document == NULL || tabData->loadingStore)
+		return;
+	refreshSeriesWidgets(tabData);
+	if (appDatastore == NULL || tabData->document->image_id <= 0)
+		return;
+	calibrationFromTab(tabData, &calibration);
+	error = NULL;
+	if (!datastore_save_calibration(appDatastore, tabData->document->image_id,
+			&calibration, &error))
+		reportDatastoreError("saving calibration", error);
 }
 
 static void clearProcessingInformation(struct TabData *tabData) {
@@ -1169,8 +1349,8 @@ static void refreshProcessingInformation(struct TabData *tabData) {
 
 	if (tabData->mousePointerCoords[0] < 0
 			|| tabData->mousePointerCoords[1] < 0
-			|| tabData->mousePointerCoords[0] >= tabData->XSize
-			|| tabData->mousePointerCoords[1] >= tabData->YSize) {
+			|| tabData->mousePointerCoords[0] >= tabData->sourceXSize
+			|| tabData->mousePointerCoords[1] >= tabData->sourceYSize) {
 		clearProcessingInformation(tabData);
 		return;
 	}
@@ -1194,56 +1374,6 @@ static void refreshProcessingInformation(struct TabData *tabData) {
 	gtk_entry_set_text(GTK_ENTRY(tabData->yerr_entry), buf);
 }
 
-gboolean allocatePointDataMemory(struct TabData *tabData) {
-	gint i;
-
-	if (tabData->lastpoints == NULL) {
-		tabData->lastpoints = (gint *) malloc(
-				sizeof(gint) * (tabData->MaxPoints + 4));
-		if (tabData->lastpoints == NULL) {
-			printf("Error allocating memory for lastpoints. Exiting.\n");
-			return FALSE;
-		}
-		tabData->points = (void *) malloc(sizeof(gdouble *) * tabData->MaxPoints);
-		if (tabData->points == NULL) {
-			printf("Error allocating memory for points. Exiting.\n");
-			return FALSE;
-		}
-		for (i = 0; i < tabData->MaxPoints; i++) {
-			tabData->points[i] = (gdouble *) malloc(sizeof(gdouble) * 2);
-			if (tabData->points[i] == NULL) {
-				printf("Error allocating memory for points[%d]. Exiting.\n", i);
-				return FALSE;
-			}
-		}
-		return TRUE;
-	}
-	if (tabData->numpoints > tabData->MaxPoints - 1) {
-		i = tabData->MaxPoints;
-		tabData->MaxPoints += MAXPOINTS;
-		tabData->lastpoints = realloc(tabData->lastpoints,
-				sizeof(gint) * (tabData->MaxPoints + 4));
-		if (tabData->lastpoints == NULL) {
-			printf("Error reallocating memory for lastpoints. Exiting.\n");
-			return FALSE;
-		}
-		tabData->points = realloc(tabData->points,
-				sizeof(gdouble *) * tabData->MaxPoints);
-		if (tabData->points == NULL) {
-			printf("Error reallocating memory for points. Exiting.\n");
-			return FALSE;
-		}
-		for (; i < tabData->MaxPoints; i++) {
-			tabData->points[i] = malloc(sizeof(gdouble) * 2);
-			if (tabData->points[i] == NULL) {
-				printf("Error allocating memory for points[%d]. Exiting.\n", i);
-				return FALSE;
-			}
-		}
-	}
-	return TRUE;
-}
-
 /****************************************************************/
 /* This function sets the numpoints entry to numpoints variable	*/
 /* value.							*/
@@ -1253,6 +1383,330 @@ void setNumberOfPointsEntryValue(GtkWidget *np_entry, gint np) {
 
 	sprintf(buf, "%d", np);
 	gtk_entry_set_text(GTK_ENTRY(np_entry), buf);
+}
+
+static gboolean tabHasPersistentImage(const struct TabData *tabData) {
+	return appDatastore != NULL && tabData != NULL && tabData->document != NULL
+			&& tabData->document->image_id > 0;
+}
+
+static void saveSeries(struct TabData *tabData, DataSeries *series,
+		const gchar *operation) {
+	GError *error;
+
+	if (!tabHasPersistentImage(tabData) || series == NULL || series->id <= 0)
+		return;
+	error = NULL;
+	if (!datastore_update_series(appDatastore, series, &error))
+		reportDatastoreError(operation, error);
+}
+
+static gboolean calibrationIsComplete(const struct TabData *tabData) {
+	gint i;
+
+	for (i = 0; i < G3_AXIS_POINT_COUNT; i++)
+		if (!tabData->bpressed[i] || !tabData->valueset[i])
+			return FALSE;
+	return TRUE;
+}
+
+static void refreshSeriesWidgets(struct TabData *tabData) {
+	DataSeries *series;
+	GdkRGBA color;
+	gint active_index;
+	guint i, selection_count;
+	gchar *selected_text;
+
+	if (tabData == NULL || tabData->series_combo == NULL
+			|| tabData->document == NULL)
+		return;
+	series = activeSeries(tabData);
+	active_index = image_document_index_of_series(tabData->document, series);
+	tabData->loadingStore = TRUE;
+	gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(tabData->series_combo));
+	for (i = 0; i < tabData->document->series->len; i++) {
+		DataSeries *item;
+		gchar *caption;
+		item = g_ptr_array_index(tabData->document->series, i);
+		caption = g_strdup_printf("%s (%u)", item->label, item->points->len);
+		gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(tabData->series_combo),
+				caption);
+		g_free(caption);
+	}
+	gtk_combo_box_set_active(GTK_COMBO_BOX(tabData->series_combo), active_index);
+	gtk_entry_set_text(GTK_ENTRY(tabData->series_label_entry),
+			series != NULL ? series->label : "");
+	if (series != NULL) {
+		rgba_to_components(series->marker_rgba, &color.red, &color.green,
+				&color.blue, &color.alpha);
+		gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(tabData->series_color_button),
+				&color);
+		gtk_toggle_button_set_active(
+				GTK_TOGGLE_BUTTON(tabData->series_visible_check), series->visible);
+	}
+	tabData->loadingStore = FALSE;
+
+	gtk_widget_set_sensitive(tabData->series_label_entry, series != NULL);
+	gtk_widget_set_sensitive(tabData->series_color_button, series != NULL);
+	gtk_widget_set_sensitive(tabData->series_visible_check, series != NULL);
+	gtk_widget_set_sensitive(tabData->delete_series_button,
+			tabData->document->series->len > 1);
+
+	selected_text = NULL;
+	selection_count = image_document_selection_count(tabData->document);
+	if (selection_count > 1) {
+		selected_text = g_strdup_printf("%u points selected", selection_count);
+	} else if (selection_count == 1
+			&& tabData->document->selected_point != NULL) {
+		SamplePoint *point;
+		DataSeries *selected_series;
+		point = tabData->document->selected_point;
+		selected_series = tabData->document->selected_series;
+		if (calibrationIsComplete(tabData)) {
+			struct PointValue value;
+			value = calculatePointValue(point->source_x_px, point->source_y_px,
+					tabData);
+			selected_text = g_strdup_printf("%s, point %" G_GINT64_FORMAT
+					": X %.8g, Y %.8g",
+					selected_series != NULL ? selected_series->label : "Selected",
+					point->sample_order + 1, value.Xv, value.Yv);
+		} else {
+			selected_text = g_strdup_printf("%s, point %" G_GINT64_FORMAT
+					": pixel %.2f, %.2f",
+					selected_series != NULL ? selected_series->label : "Selected",
+					point->sample_order + 1, point->source_x_px,
+					point->source_y_px);
+		}
+	} else {
+		selected_text = g_strdup("No point selected");
+	}
+	gtk_label_set_text(GTK_LABEL(tabData->selected_point_label), selected_text);
+	g_free(selected_text);
+	updateEditMenuSensitivity(tabData);
+}
+
+static void activeSeriesChanged(GtkComboBox *combo, gpointer data) {
+	struct TabData *tabData;
+	DataSeries *series;
+	gint index;
+	GError *error;
+
+	tabData = (struct TabData *) data;
+	if (tabData->loadingStore)
+		return;
+	index = gtk_combo_box_get_active(combo);
+	if (index < 0 || (guint) index >= tabData->document->series->len)
+		return;
+	series = g_ptr_array_index(tabData->document->series, index);
+	image_document_set_active_series(tabData->document, series);
+	if (tabHasPersistentImage(tabData) && series->id > 0) {
+		error = NULL;
+		if (!datastore_set_active_series(appDatastore,
+				tabData->document->image_id, series->id, &error))
+			reportDatastoreError("selecting a series", error);
+	}
+	syncActivePointCount(tabData);
+	refreshSeriesWidgets(tabData);
+	triggerUpdateDrawArea(tabData->drawing_area);
+}
+
+static void seriesLabelChanged(GtkEditable *editable, gpointer data) {
+	struct TabData *tabData;
+	DataSeries *series;
+	gchar *caption;
+	gint index;
+
+	tabData = (struct TabData *) data;
+	if (tabData->loadingStore)
+		return;
+	series = activeSeries(tabData);
+	if (series == NULL)
+		return;
+	g_free(series->label);
+	series->label = g_strdup(gtk_entry_get_text(GTK_ENTRY(editable)));
+	saveSeries(tabData, series, "renaming a series");
+	/* Keep the selector caption current without disturbing keyboard focus. */
+	index = image_document_index_of_series(tabData->document, series);
+	caption = g_strdup_printf("%s (%u)", series->label, series->points->len);
+	tabData->loadingStore = TRUE;
+	gtk_combo_box_text_remove(GTK_COMBO_BOX_TEXT(tabData->series_combo),
+			index);
+	gtk_combo_box_text_insert_text(GTK_COMBO_BOX_TEXT(tabData->series_combo),
+			index, caption);
+	gtk_combo_box_set_active(GTK_COMBO_BOX(tabData->series_combo),
+			index);
+	tabData->loadingStore = FALSE;
+	g_free(caption);
+}
+
+static void seriesColorChanged(GtkColorButton *button, gpointer data) {
+	struct TabData *tabData;
+	DataSeries *series;
+	GdkRGBA color;
+
+	tabData = (struct TabData *) data;
+	if (tabData->loadingStore)
+		return;
+	series = activeSeries(tabData);
+	if (series == NULL)
+		return;
+	gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(button), &color);
+	series->marker_rgba = rgba_from_components(color.red, color.green,
+			color.blue, color.alpha);
+	saveSeries(tabData, series, "changing a series colour");
+	triggerUpdateDrawArea(tabData->drawing_area);
+}
+
+static void seriesVisibilityChanged(GtkToggleButton *button, gpointer data) {
+	struct TabData *tabData;
+	DataSeries *series;
+
+	tabData = (struct TabData *) data;
+	if (tabData->loadingStore)
+		return;
+	series = activeSeries(tabData);
+	if (series == NULL)
+		return;
+	series->visible = gtk_toggle_button_get_active(button);
+	saveSeries(tabData, series, "changing series visibility");
+	triggerUpdateDrawArea(tabData->drawing_area);
+}
+
+static void editModeChanged(GtkToggleButton *button, gpointer data) {
+	struct TabData *tabData;
+
+	tabData = (struct TabData *) data;
+	if (!gtk_toggle_button_get_active(button))
+		return;
+	tabData->editMode = TRUE;
+	tabData->movedPoint = NULL;
+	triggerUpdateDrawArea(tabData->drawing_area);
+}
+
+static void addModeChanged(GtkToggleButton *button, gpointer data) {
+	struct TabData *tabData;
+
+	tabData = (struct TabData *) data;
+	if (!gtk_toggle_button_get_active(button))
+		return;
+	tabData->editMode = FALSE;
+	tabData->movedPoint = NULL;
+	if (tabData->document != NULL) {
+		tabData->document->hovered_point = NULL;
+		tabData->document->hovered_series = NULL;
+	}
+	triggerUpdateDrawArea(tabData->drawing_area);
+}
+
+static void addSeries(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData;
+	DataSeries *series;
+	gchar *label;
+	GError *error;
+
+	(void) widget;
+	tabData = (struct TabData *) data;
+	label = image_document_next_series_label(tabData->document);
+	series = image_document_add_series(tabData->document, label,
+			image_document_next_color(tabData->document));
+	g_free(label);
+	image_document_set_active_series(tabData->document, series);
+	if (tabHasPersistentImage(tabData)) {
+		error = NULL;
+		if (!datastore_insert_series(appDatastore, tabData->document->image_id,
+				series, &error)
+				|| !datastore_set_active_series(appDatastore,
+						tabData->document->image_id, series->id, &error))
+			reportDatastoreError("creating a series", error);
+	}
+	syncActivePointCount(tabData);
+	refreshSeriesWidgets(tabData);
+	gtk_widget_grab_focus(tabData->series_label_entry);
+	gtk_editable_select_region(GTK_EDITABLE(tabData->series_label_entry), 0, -1);
+	triggerUpdateDrawArea(tabData->drawing_area);
+}
+
+static void deleteSeries(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData;
+	DataSeries *series;
+	GtkWidget *dialog;
+	GError *error;
+
+	(void) widget;
+	tabData = (struct TabData *) data;
+	series = activeSeries(tabData);
+	if (series == NULL || tabData->document->series->len <= 1)
+		return;
+	if (series->points->len > 0) {
+		dialog = gtk_message_dialog_new(GTK_WINDOW(window),
+				GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+				GTK_MESSAGE_WARNING, GTK_BUTTONS_NONE,
+				"Delete series ‘%s’ and its %u points?", series->label,
+				series->points->len);
+		gtk_dialog_add_buttons(GTK_DIALOG(dialog), "_Cancel", GTK_RESPONSE_CANCEL,
+				"_Delete", GTK_RESPONSE_ACCEPT, NULL);
+		if (gtk_dialog_run(GTK_DIALOG(dialog)) != GTK_RESPONSE_ACCEPT) {
+			gtk_widget_destroy(dialog);
+			return;
+		}
+		gtk_widget_destroy(dialog);
+	}
+	if (tabHasPersistentImage(tabData) && series->id > 0) {
+		error = NULL;
+		if (!datastore_delete_series(appDatastore, series->id, &error)) {
+			reportDatastoreError("deleting a series", error);
+			return;
+		}
+	}
+	image_document_remove_series(tabData->document, series);
+	series = activeSeries(tabData);
+	if (tabHasPersistentImage(tabData) && series != NULL && series->id > 0) {
+		error = NULL;
+		if (!datastore_set_active_series(appDatastore,
+				tabData->document->image_id, series->id, &error))
+			reportDatastoreError("selecting the remaining series", error);
+	}
+	syncActivePointCount(tabData);
+	refreshSeriesWidgets(tabData);
+	triggerUpdateDrawArea(tabData->drawing_area);
+}
+
+static void deleteSelectedPoint(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData;
+	DataSeries *series;
+	GPtrArray *selected_points;
+	guint i;
+
+	(void) widget;
+	tabData = (struct TabData *) data;
+	if (tabData == NULL || tabData->document == NULL)
+		return;
+	series = tabData->document->selected_series;
+	if (series == NULL || image_document_selection_count(tabData->document) == 0)
+		return;
+	selected_points = g_ptr_array_new();
+	for (i = 0; i < tabData->document->selected_points->len; i++)
+		g_ptr_array_add(selected_points,
+				g_ptr_array_index(tabData->document->selected_points, i));
+	image_document_clear_selection(tabData->document);
+	for (i = 0; i < selected_points->len; i++) {
+		SamplePoint *point;
+		GError *error;
+
+		point = g_ptr_array_index(selected_points, i);
+		if (tabHasPersistentImage(tabData) && point->id > 0) {
+			error = NULL;
+			if (!datastore_delete_point(appDatastore, point->id, &error)) {
+				reportDatastoreError("deleting a selected point", error);
+				continue;
+			}
+		}
+		data_series_remove_point(series, point);
+	}
+	g_ptr_array_free(selected_points, TRUE);
+	syncActivePointCount(tabData);
+	refreshSeriesWidgets(tabData);
+	triggerUpdateDrawArea(tabData->drawing_area);
 }
 
 static void triggerUpdateDrawArea(GtkWidget *area) {
@@ -1266,6 +1720,78 @@ void triggerLimitedUpdateDrawArea(GtkWidget *area, gint x, gint y) {
 			2 * (MARKERSIZE + MARKERTHICKNESS));
 }
 
+static SamplePoint *findPointAt(struct TabData *tabData, gdouble imageX,
+		gdouble imageY, DataSeries **matchedSeries) {
+	gint pass;
+	guint series_index, point_index;
+	gdouble best_distance, threshold;
+	SamplePoint *best_point;
+	DataSeries *best_series;
+
+	best_point = NULL;
+	best_series = NULL;
+	best_distance = G_MAXDOUBLE;
+	threshold = 7.0;
+	if (tabData->document == NULL)
+		return NULL;
+	for (pass = 0; pass < 2; pass++) {
+		for (series_index = 0; series_index < tabData->document->series->len;
+				series_index++) {
+			DataSeries *series;
+			series = g_ptr_array_index(tabData->document->series, series_index);
+			if (!series->visible
+					|| (pass == 0 && series != tabData->document->active_series)
+					|| (pass == 1 && series == tabData->document->active_series))
+				continue;
+			for (point_index = 0; point_index < series->points->len; point_index++) {
+				SamplePoint *point;
+				gdouble dx, dy, distance;
+				point = g_ptr_array_index(series->points, point_index);
+				dx = (point->source_x_px - imageX) * tabData->imageScale
+						* tabData->viewZoom;
+				dy = (point->source_y_px - imageY) * tabData->imageScale
+						* tabData->viewZoom;
+				distance = sqrt(dx * dx + dy * dy);
+				if (distance <= threshold && distance < best_distance) {
+					best_distance = distance;
+					best_point = point;
+					best_series = series;
+				}
+			}
+		}
+		if (best_point != NULL)
+			break;
+	}
+	if (matchedSeries != NULL)
+		*matchedSeries = best_series;
+	return best_point;
+}
+
+static void selectPoint(struct TabData *tabData, DataSeries *series,
+		SamplePoint *point, gboolean extend_selection) {
+	if (tabData->document == NULL)
+		return;
+	if (series != NULL && series != tabData->document->active_series) {
+		GError *error;
+		image_document_set_active_series(tabData->document, series);
+		if (tabHasPersistentImage(tabData) && series->id > 0) {
+			error = NULL;
+			if (!datastore_set_active_series(appDatastore,
+					tabData->document->image_id, series->id, &error))
+				reportDatastoreError("selecting a point's series", error);
+		}
+		syncActivePointCount(tabData);
+		refreshSeriesWidgets(tabData);
+	}
+	if (point == NULL && extend_selection)
+		return;
+	image_document_select_point(tabData->document, series, point,
+			extend_selection);
+	refreshSeriesWidgets(tabData);
+	refreshProcessingInformation(tabData);
+	triggerUpdateDrawArea(tabData->drawing_area);
+}
+
 /****************************************************************/
 /* When a button is pressed inside the drawing area this 	*/
 /* function is called, it handles axispoints and graphpoints	*/
@@ -1275,42 +1801,57 @@ gint mouseButtonPressEvent(GtkWidget *widget, GdkEventButton *event,
 		gpointer data) {
 	gint i, j;
 	gdouble imageX, imageY;
+	gboolean settingAxis, shiftSelecting;
 	struct TabData *tabData;
 
 	(void) widget;
 	tabData = (struct TabData *) data;
+	gtk_widget_grab_focus(tabData->drawing_area);
 
 	getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
-
-	allocatePointDataMemory(tabData);
+	settingAxis = tabData->setxypressed[0] || tabData->setxypressed[1]
+			|| tabData->setxypressed[2] || tabData->setxypressed[3];
+	shiftSelecting = (event->state & GDK_SHIFT_MASK) != 0 && !settingAxis;
 
 	if (event->button == 1) { /* If button 1 (leftmost) is pressed */
-		if (MovePointMode) {
-			for (i = 0; i < tabData->numpoints; i++) {
-				if (fabs(tabData->points[i][0] - imageX) < GRABTRESHOLD
-						&& fabs(tabData->points[i][1] - imageY) < GRABTRESHOLD) {
-					//					printf("Moving point %d\n", i);
-					tabData->movedPointIndex = i;
-					tabData->movedOrigCoords[0] = tabData->points[i][0];
-					tabData->movedOrigCoords[1] = tabData->points[i][1];
-					tabData->movedOrigMousePtrCoords[0] = imageX;
-					tabData->movedOrigMousePtrCoords[1] = imageY;
-					break;
-				}
+		if (shiftSelecting && tabData->edit_mode_button != NULL)
+			gtk_toggle_button_set_active(
+					GTK_TOGGLE_BUTTON(tabData->edit_mode_button), TRUE);
+		if ((tabData->editMode || MovePointMode || shiftSelecting) && !settingAxis) {
+			DataSeries *series;
+			SamplePoint *point;
+			series = NULL;
+			point = findPointAt(tabData, imageX, imageY, &series);
+			selectPoint(tabData, series, point, shiftSelecting);
+			if (point != NULL && !shiftSelecting
+					&& image_document_point_is_selected(tabData->document, point)) {
+				tabData->movedPoint = point;
+				tabData->movedSeries = series;
+				tabData->movedOrigCoords[0] = point->source_x_px;
+				tabData->movedOrigCoords[1] = point->source_y_px;
+				tabData->movedOrigMousePtrCoords[0] = imageX;
+				tabData->movedOrigMousePtrCoords[1] = imageY;
 			}
 		} else {
 			/* If none of the set axispoint buttons been pressed */
-			if (!tabData->setxypressed[0] && !tabData->setxypressed[1]
-					&& !tabData->setxypressed[2] && !tabData->setxypressed[3]) {
-				tabData->points[tabData->numpoints][0] = imageX; /* Save x coordinate */
-				tabData->points[tabData->numpoints][1] = imageY; /* Save x coordinate */
-				tabData->lastpoints[tabData->numlastpoints] =
-						tabData->numpoints; /* Save index of point */
-				tabData->numlastpoints++; /* Increase lastpoint index */
-				tabData->numpoints++; /* Increase point counter */
-				setNumberOfPointsEntryValue(tabData->nump_entry,
-						tabData->numpoints);
-
+			if (!settingAxis) {
+				DataSeries *series;
+				SamplePoint *point;
+				GError *error;
+				if (imageX < 0 || imageY < 0 || imageX >= tabData->sourceXSize
+						|| imageY >= tabData->sourceYSize)
+					return TRUE;
+				series = activeSeries(tabData);
+				if (series == NULL)
+					return TRUE;
+				point = data_series_add_point(series, imageX, imageY);
+				error = NULL;
+				if (tabHasPersistentImage(tabData) && series->id > 0 && point != NULL
+						&& !datastore_insert_point(appDatastore, series->id, point,
+								&error))
+					reportDatastoreError("adding a point", error);
+				syncActivePointCount(tabData);
+				refreshSeriesWidgets(tabData);
 			} else {
 				for (i = 0; i < 4; i++)
 					if (tabData->setxypressed[i]) { /* If the "Set point 1 on x axis" button is pressed */
@@ -1329,9 +1870,7 @@ gint mouseButtonPressEvent(GtkWidget *widget, GdkEventButton *event,
 						gtk_toggle_button_set_active(
 								GTK_TOGGLE_BUTTON(tabData->setxybutton[i]),
 								FALSE); /* Pop up the button */
-						tabData->lastpoints[tabData->numlastpoints] = -(i + 1); /* Remember that the points been put out */
-						tabData->numlastpoints++; /* Increase index of lastpoints */
-
+						persistCalibration(tabData);
 					}
 			}
 			setButtonSensitivity(tabData);
@@ -1362,16 +1901,14 @@ gint mouseButtonPressEvent(GtkWidget *widget, GdkEventButton *event,
 				tabData->bpressed[i] = TRUE;
 				gtk_toggle_button_set_active(
 						GTK_TOGGLE_BUTTON(tabData->setxybutton[i]), FALSE);
-				tabData->lastpoints[tabData->numlastpoints] = -(i + 1);
-				tabData->numlastpoints++;
-
+				persistCalibration(tabData);
 				break;
 			}
 	}
 
 	triggerUpdateDrawArea(tabData->drawing_area);
-	if (imageX >= 0 && imageY >= 0 && imageX < tabData->XSize
-			&& imageY < tabData->YSize) {
+	if (imageX >= 0 && imageY >= 0 && imageX < tabData->sourceXSize
+			&& imageY < tabData->sourceYSize) {
 		tabData->mousePointerCoords[0] = imageX;
 		tabData->mousePointerCoords[1] = imageY;
 	}
@@ -1388,7 +1925,6 @@ gint mouseButtonPressEvent(GtkWidget *widget, GdkEventButton *event,
 /****************************************************************/
 gint mouseButtonReleaseEvent(GtkWidget *widget, GdkEventButton *event,
 		gpointer data) {
-	gint i;
 	gdouble imageX, imageY;
 	struct TabData *tabData;
 
@@ -1398,14 +1934,25 @@ gint mouseButtonReleaseEvent(GtkWidget *widget, GdkEventButton *event,
 	getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
 
 	if (event->button == 1) {
-		if (MovePointMode && tabData->movedPointIndex != NONESELECTED) {
-			i = tabData->movedPointIndex;
-			tabData->points[i][0] = tabData->movedOrigCoords[0]
-					+ (imageX - tabData->movedOrigMousePtrCoords[0]);
-			tabData->points[i][1] = tabData->movedOrigCoords[1]
-					+ (imageY - tabData->movedOrigMousePtrCoords[1]);
-			tabData->movedPointIndex = NONESELECTED;
+		if (tabData->movedPoint != NULL) {
+			GError *error;
+			tabData->movedPoint->source_x_px = CLAMP(
+					tabData->movedOrigCoords[0]
+							+ (imageX - tabData->movedOrigMousePtrCoords[0]),
+					0.0, tabData->sourceXSize - 1.0);
+			tabData->movedPoint->source_y_px = CLAMP(
+					tabData->movedOrigCoords[1]
+							+ (imageY - tabData->movedOrigMousePtrCoords[1]),
+					0.0, tabData->sourceYSize - 1.0);
+			error = NULL;
+			if (tabHasPersistentImage(tabData) && tabData->movedPoint->id > 0
+					&& !datastore_update_point(appDatastore, tabData->movedPoint,
+							&error))
+				reportDatastoreError("moving a point", error);
+			tabData->movedPoint = NULL;
+			tabData->movedSeries = NULL;
 			triggerUpdateDrawArea(tabData->drawing_area);
+			refreshSeriesWidgets(tabData);
 		}
 	} else if (event->button == 2) {
 		if (tabData->middlePanning) {
@@ -1425,7 +1972,6 @@ gint mouseButtonReleaseEvent(GtkWidget *widget, GdkEventButton *event,
 /* position and plots it on the zoom area.			*/
 /****************************************************************/
 gint mouseMotionEvent(GtkWidget *widget, GdkEventMotion *event, gpointer data) {
-	gint i;
 	gdouble imageX, imageY;
 	struct TabData *tabData;
 
@@ -1441,8 +1987,10 @@ gint mouseMotionEvent(GtkWidget *widget, GdkEventMotion *event, gpointer data) {
 
 			dx = event->x_root - tabData->middlePanStartMouse[0];
 			dy = event->y_root - tabData->middlePanStartMouse[1];
-			if (fabs(dx) > 1.0 || fabs(dy) > 1.0)
+			if (fabs(dx) > 1.0 || fabs(dy) > 1.0) {
 				tabData->middlePanMoved = TRUE;
+				disableZoomToFit(tabData);
+			}
 
 			oldH = gtk_adjustment_get_value(hadj);
 			oldV = gtk_adjustment_get_value(vadj);
@@ -1473,21 +2021,36 @@ gint mouseMotionEvent(GtkWidget *widget, GdkEventMotion *event, gpointer data) {
 	getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
 	/* on drawing area. */
 
-	if (imageX >= 0 && imageY >= 0 && imageX < tabData->XSize
-			&& imageY < tabData->YSize) {
-		if (MovePointMode && tabData->movedPointIndex != NONESELECTED) {
-			i = tabData->movedPointIndex;
-			tabData->points[i][0] = tabData->movedOrigCoords[0]
-					+ (imageX - tabData->movedOrigMousePtrCoords[0]);
-			tabData->points[i][1] = tabData->movedOrigCoords[1]
-					+ (imageY - tabData->movedOrigMousePtrCoords[1]);
-			tabData->mousePointerCoords[0] = tabData->points[i][0];
-			tabData->mousePointerCoords[1] = tabData->points[i][1];
+	if (imageX >= 0 && imageY >= 0 && imageX < tabData->sourceXSize
+			&& imageY < tabData->sourceYSize) {
+		if (tabData->movedPoint != NULL) {
+			tabData->movedPoint->source_x_px = CLAMP(
+					tabData->movedOrigCoords[0]
+							+ (imageX - tabData->movedOrigMousePtrCoords[0]),
+					0.0, tabData->sourceXSize - 1.0);
+			tabData->movedPoint->source_y_px = CLAMP(
+					tabData->movedOrigCoords[1]
+							+ (imageY - tabData->movedOrigMousePtrCoords[1]),
+					0.0, tabData->sourceYSize - 1.0);
+			tabData->mousePointerCoords[0] = tabData->movedPoint->source_x_px;
+			tabData->mousePointerCoords[1] = tabData->movedPoint->source_y_px;
 
 			triggerUpdateDrawArea(tabData->drawing_area);
 		} else {
 			tabData->mousePointerCoords[0] = imageX;
 			tabData->mousePointerCoords[1] = imageY;
+			if (tabData->editMode && tabData->document != NULL) {
+				DataSeries *hovered_series;
+				SamplePoint *hovered_point;
+				hovered_series = NULL;
+				hovered_point = findPointAt(tabData, imageX, imageY,
+						&hovered_series);
+				if (hovered_point != tabData->document->hovered_point) {
+					tabData->document->hovered_point = hovered_point;
+					tabData->document->hovered_series = hovered_series;
+					triggerUpdateDrawArea(tabData->drawing_area);
+				}
+			}
 		}
 
 		triggerUpdateDrawArea(tabData->zoom_area);
@@ -1520,6 +2083,7 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 			event->delta_y, ctrlDown, shiftDown, event->x, event->y);
 
 	if (ctrlDown) {
+		disableZoomToFit(tabData);
 		newZoom = tabData->viewZoom;
 		if (event->direction == GDK_SCROLL_UP) {
 			newZoom *= MAIN_IMAGE_ZOOM_STEP;
@@ -1542,11 +2106,13 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 			focusY = -1.0;
 		} else {
 			getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
-			imageX = CLAMP(imageX, 0.0, tabData->XSize - 1.0);
-			imageY = CLAMP(imageY, 0.0, tabData->YSize - 1.0);
-			focusX = imageX * tabData->viewZoom + tabData->viewOrigin[0]
+			imageX = CLAMP(imageX, 0.0, tabData->sourceXSize - 1.0);
+			imageY = CLAMP(imageY, 0.0, tabData->sourceYSize - 1.0);
+			focusX = imageX * tabData->imageScale * tabData->viewZoom
+					+ tabData->viewOrigin[0]
 					- gtk_adjustment_get_value(hadj);
-			focusY = imageY * tabData->viewZoom + tabData->viewOrigin[1]
+			focusY = imageY * tabData->imageScale * tabData->viewZoom
+					+ tabData->viewOrigin[1]
 					- gtk_adjustment_get_value(vadj);
 		}
 
@@ -1577,6 +2143,8 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 	if (!shiftDown && event->direction != GDK_SCROLL_LEFT
 			&& event->direction != GDK_SCROLL_RIGHT)
 		deltaX = 0.0;
+	if (deltaX != 0.0 || (deltaY != 0.0 && !shiftDown))
+		disableZoomToFit(tabData);
 
 	if (deltaX != 0.0) {
 		gdouble newH = gtk_adjustment_get_value(hadj) + deltaX;
@@ -1601,6 +2169,15 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 	}
 
 	return TRUE;
+}
+
+static gboolean scrollbarChangeValue(GtkRange *range, GtkScrollType scroll,
+		gdouble value, gpointer data) {
+	(void) range;
+	(void) scroll;
+	(void) value;
+	disableZoomToFit((struct TabData *) data);
+	return FALSE;
 }
 
 /****************************************************************/
@@ -1630,50 +2207,49 @@ void setAxisMarkerSetMode(GtkToggleButton *widget, gpointer data) {
 		tabData->bpressed[index] = FALSE; /* Set x axis point 1 to unset */
 		gtk_widget_queue_draw(tabData->drawing_area);
 		refreshProcessingInformation(tabData);
+		persistCalibration(tabData);
 	} else { /* If button is trying to get unpressed */
 		if (tabData->setxypressed[index])
 			gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), TRUE); /* Set button down */
 	}
 }
 
-/****************************************************************/
-/* Set type of ordering at output of data.			*/
-/****************************************************************/
-void setOutputOrdering(GtkWidget *widget, gpointer data) {
-	gint ordering;
-	struct ButtonData *buttonData;
-	struct TabData *tabData;
+static void applyExportPreferencesToTabs(void) {
+	gint i;
 
-	buttonData = (struct ButtonData *) data;
-	ordering = buttonData->index;
-	tabData = buttonData->tabData;
-	tabData->ordering = ordering; /* Set ordering control variable */
-}
-
-/****************************************************************/
-/****************************************************************/
-void setOutputAction(GtkWidget *widget, gpointer data) {
-	gint action;
-	struct ButtonData *buttonData;
-	struct TabData *tabData;
-
-	buttonData = (struct ButtonData *) data;
-	if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget)))
+	if (mainnotebook == NULL)
 		return;
-	action = buttonData->index;
-	tabData = buttonData->tabData;
-	tabData->Action = action;
-	setButtonSensitivity(tabData);
+	for (i = 0; i < gtk_notebook_get_n_pages(GTK_NOTEBOOK(mainnotebook)); i++) {
+		GtkWidget *page;
+		struct TabData *tabData;
+
+		page = gtk_notebook_get_nth_page(GTK_NOTEBOOK(mainnotebook), i);
+		tabData = g_object_get_data(G_OBJECT(page), DATA_STORE_NAME);
+		if (tabData == NULL)
+			continue;
+		tabData->ordering = exportOrdering;
+		tabData->UseErrors = exportUseErrors;
+	}
 }
 
-/****************************************************************/
-/* Set whether to use error evaluation and printing or not.	*/
-/****************************************************************/
-void setPrintErrorUsage(GtkToggleButton *widget, gpointer data) {
-	struct TabData *tabData;
+static void exportOrderingChanged(GtkCheckMenuItem *widget, gpointer data) {
+	gint ordering;
 
-	tabData = (struct TabData *) data;
-	tabData->UseErrors = gtk_toggle_button_get_active(widget);
+	if (!gtk_check_menu_item_get_active(widget))
+		return;
+	ordering = GPOINTER_TO_INT(data);
+	if (ordering < 0 || ordering >= ORDERBNUM)
+		return;
+	exportOrdering = ordering;
+	applyExportPreferencesToTabs();
+	saveExportPreferences();
+}
+
+static void exportErrorsChanged(GtkCheckMenuItem *widget, gpointer data) {
+	(void) data;
+	exportUseErrors = gtk_check_menu_item_get_active(widget);
+	applyExportPreferencesToTabs();
+	saveExportPreferences();
 }
 
 /****************************************************************/
@@ -1706,30 +2282,7 @@ void readXYEntryValues(GtkWidget *entry, gpointer data) {
 
 	setButtonSensitivity(tabData);
 	refreshProcessingInformation(tabData);
-}
-
-/****************************************************************/
-/* If all the axispoints has been put out, values for these	*/
-/* have been assigned and at least one point has been set on	*/
-/* the graph activate the write to file button.			*/
-/****************************************************************/
-void readFileEntry(GtkWidget *entry, gpointer data) {
-	struct TabData *tabData;
-
-	tabData = (struct TabData *) data;
-
-	tabData->file_name = (gchar *) gtk_entry_get_text(GTK_ENTRY (entry));
-	tabData->file_name_length = strlen(tabData->file_name); /* Get length of string */
-
-	if (tabData->bpressed[0] && tabData->bpressed[1] && tabData->bpressed[2]
-			&& tabData->bpressed[3] && tabData->valueset[0]
-			&& tabData->valueset[1] && tabData->valueset[2]
-			&& tabData->valueset[3] && tabData->numpoints > 0
-			&& tabData->file_name_length > 0) {
-		gtk_widget_set_sensitive(tabData->exportbutton, TRUE);
-	} else
-		gtk_widget_set_sensitive(tabData->exportbutton, FALSE);
-
+	persistCalibration(tabData);
 }
 
 /****************************************************************/
@@ -1760,6 +2313,7 @@ void checkValuesOnLogarithmicAxis(GtkToggleButton *widget, gpointer data) {
 	}
 	setButtonSensitivity(tabData);
 	refreshProcessingInformation(tabData);
+	persistCalibration(tabData);
 }
 
 /****************************************************************/
@@ -1767,29 +2321,28 @@ void checkValuesOnLogarithmicAxis(GtkToggleButton *widget, gpointer data) {
 /* indexed by remthis (<0).					*/
 /****************************************************************/
 void removeLastPoint(GtkWidget *widget, gpointer data) {
-	gint i;
+	DataSeries *series;
+	SamplePoint *point;
+	GError *error;
 	struct TabData *tabData;
 
+	(void) widget;
 	tabData = (struct TabData *) data;
-
-	/* First redraw the drawing_area with the original image, to clean it. */
-
-	if (tabData->numlastpoints > 0) { /* If points been put out, remove last one */
-		tabData->numlastpoints--;
-		for (i = 0; i < 4; i++)
-			if (tabData->lastpoints[tabData->numlastpoints] == -(i + 1)) { /* If point to be removed is axispoint 1-4 */
-				tabData->bpressed[i] = FALSE; /* Mark it unpressed.			*/
-				gtk_widget_set_sensitive(tabData->xyentry[i], FALSE); /* Inactivate entry for point.		*/
-				break;
-			}
-		if (i == 4)
-			tabData->numpoints--; /* If its none of the X/Y markers then	*/
-		setNumberOfPointsEntryValue(tabData->nump_entry, tabData->numpoints); /* its an ordinary marker, remove it.	 */
-	}
+	series = activeSeries(tabData);
+	if (series == NULL || series->points->len == 0)
+		return;
+	point = g_ptr_array_index(series->points, series->points->len - 1);
+	error = NULL;
+	if (tabHasPersistentImage(tabData) && point->id > 0
+			&& !datastore_delete_point(appDatastore, point->id, &error))
+		reportDatastoreError("removing the last point", error);
+	if (image_document_point_is_selected(tabData->document, point))
+		image_document_clear_selection(tabData->document);
+	g_ptr_array_remove_index(series->points, series->points->len - 1);
+	syncActivePointCount(tabData);
 
 	triggerUpdateDrawArea(tabData->drawing_area);
-
-	setButtonSensitivity(tabData);
+	refreshSeriesWidgets(tabData);
 	refreshProcessingInformation(tabData);
 }
 
@@ -1798,36 +2351,37 @@ void removeLastPoint(GtkWidget *widget, gpointer data) {
 /* remove_last, to remove all points except the axis points.	*/
 /****************************************************************/
 void removeAllPoints(GtkWidget *widget, gpointer data) {
-	gint i, j, index;
+	DataSeries *series;
+	GError *error;
+	GtkWidget *dialog;
 	struct TabData *tabData;
 
+	(void) widget;
 	tabData = (struct TabData *) data;
-
-	if (tabData->numlastpoints > 0 && tabData->numpoints > 0) {
-		index = 0;
-		for (i = 0; i < tabData->numlastpoints; i++)
-			for (j = 0; j < 4; j++) { /* Search for axispoints and store them in */
-				if (tabData->lastpoints[i] == -(j + 1)) { /* lastpoints at the first positions.      */
-					tabData->lastpoints[index] = -(j + 1);
-					index++;
-				}
-			}
-		tabData->lastpoints[index] = 0;
-
-		tabData->numlastpoints = index + 1;
-		tabData->numpoints = 1;
-		setNumberOfPointsEntryValue(tabData->nump_entry, tabData->numpoints);
-
-		removeLastPoint(widget, data); /* Call remove_last() for housekeeping */
-	} else if (tabData->numlastpoints > 0 && tabData->numpoints == 0) {
-		tabData->numlastpoints = 0; /* Nullify amount of points */
-		for (i = 0; i < 4; i++) {
-			tabData->valueset[i] = FALSE;
-			tabData->bpressed[i] = FALSE;
-			gtk_entry_set_text((GtkEntry *) tabData->xyentry[i], "");
-		}
-		removeLastPoint(widget, data); /* Call remove_last() for housekeeping */
+	series = activeSeries(tabData);
+	if (series == NULL || series->points->len == 0)
+		return;
+	dialog = gtk_message_dialog_new(GTK_WINDOW(window),
+			GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+			GTK_MESSAGE_WARNING, GTK_BUTTONS_NONE,
+			"Clear all %u points from series ‘%s’?", series->points->len,
+			series->label);
+	gtk_dialog_add_buttons(GTK_DIALOG(dialog), "_Cancel", GTK_RESPONSE_CANCEL,
+			"_Clear", GTK_RESPONSE_ACCEPT, NULL);
+	if (gtk_dialog_run(GTK_DIALOG(dialog)) != GTK_RESPONSE_ACCEPT) {
+		gtk_widget_destroy(dialog);
+		return;
 	}
+	gtk_widget_destroy(dialog);
+	error = NULL;
+	if (tabHasPersistentImage(tabData) && series->id > 0
+			&& !datastore_delete_series_points(appDatastore, series->id, &error))
+		reportDatastoreError("clearing a series", error);
+	g_ptr_array_set_size(series->points, 0);
+	image_document_clear_selection(tabData->document);
+	syncActivePointCount(tabData);
+	refreshSeriesWidgets(tabData);
+	triggerUpdateDrawArea(tabData->drawing_area);
 }
 
 /****************************************************************/
@@ -1851,6 +2405,7 @@ gint keyPressEvent(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 			return 0;
 
 		if (event->keyval == GDK_KEY_Left) {
+			disableZoomToFit(tabData);
 			adjustment = gtk_scrollable_get_hadjustment(
 					(GtkScrollable *) tabData->ViewPort);
 			adj_val = gtk_adjustment_get_value(adjustment);
@@ -1861,6 +2416,7 @@ gint keyPressEvent(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 			gtk_scrollable_set_hadjustment((GtkScrollable *) tabData->ViewPort,
 					adjustment);
 		} else if (event->keyval == GDK_KEY_Right) {
+			disableZoomToFit(tabData);
 			adjustment = gtk_scrollable_get_hadjustment(
 					(GtkScrollable *) tabData->ViewPort);
 			adj_val = gtk_adjustment_get_value(adjustment);
@@ -1874,6 +2430,7 @@ gint keyPressEvent(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 			gtk_scrollable_set_hadjustment((GtkScrollable *) tabData->ViewPort,
 					adjustment);
 		} else if (event->keyval == GDK_KEY_Up) {
+			disableZoomToFit(tabData);
 			adjustment = gtk_scrollable_get_vadjustment(
 					(GtkScrollable *) tabData->ViewPort);
 			adj_val = gtk_adjustment_get_value(adjustment);
@@ -1884,6 +2441,7 @@ gint keyPressEvent(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 			gtk_scrollable_set_vadjustment((GtkScrollable *) tabData->ViewPort,
 					adjustment);
 		} else if (event->keyval == GDK_KEY_Down) {
+			disableZoomToFit(tabData);
 			adjustment = gtk_scrollable_get_vadjustment(
 					(GtkScrollable *) tabData->ViewPort);
 			adj_val = gtk_adjustment_get_value(adjustment);
@@ -1906,12 +2464,18 @@ gint keyPressEvent(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 			MovePointMode = TRUE;
 		} else if (event->keyval == GDK_KEY_plus
 				|| event->keyval == GDK_KEY_KP_Add) {
+			disableZoomToFit(tabData);
 			setMainImageZoom(tabData, tabData->viewZoom * MAIN_IMAGE_ZOOM_STEP,
 					-1, -1);
 		} else if (event->keyval == GDK_KEY_minus
 				|| event->keyval == GDK_KEY_KP_Subtract) {
+			disableZoomToFit(tabData);
 			setMainImageZoom(tabData, tabData->viewZoom / MAIN_IMAGE_ZOOM_STEP,
 					-1, -1);
+		} else if ((event->keyval == GDK_KEY_Delete
+				|| event->keyval == GDK_KEY_BackSpace)
+				&& gtk_window_get_focus(GTK_WINDOW(window)) == tabData->drawing_area) {
+			deleteSelectedPoint(NULL, tabData);
 		}
 	}
 	return 0;
@@ -1972,6 +2536,9 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 
 	tabData->XSize = cairo_image_surface_get_width(tabData->image);
 	tabData->YSize = cairo_image_surface_get_height(tabData->image);
+	tabData->sourceXSize = tabData->XSize;
+	tabData->sourceYSize = tabData->YSize;
+	tabData->imageScale = 1.0;
 	G3DBG("addImageToTab: loaded '%s' image=%dx%d scale_arg=%.6f\n", filename,
 			tabData->XSize, tabData->YSize, Scale);
 
@@ -1980,7 +2547,8 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 		if (tabData->XSize > maxX) {
 			mScale = (double) maxX / tabData->XSize;
 		}
-		if (tabData->YSize > maxY && (double) maxY / tabData->YSize < mScale)
+		if (tabData->YSize > maxY
+				&& (mScale < 0 || (double) maxY / tabData->YSize < mScale))
 			mScale = (double) maxY / tabData->YSize;
 	}
 
@@ -1988,30 +2556,29 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 		Scale = mScale;
 
 	if (Scale != -1) {
+		cairo_surface_t *source_image;
+		cairo_surface_t *scaled_image;
+		cairo_t *scaled_cr;
+
+		tabData->imageScale = Scale;
 		tabData->XSize *= Scale;
 		tabData->YSize *= Scale;
 
-		// flush to ensure all writing to the image was done
-		cairo_surface_flush(tabData->image);
-
-		cairo_t *cr;
-		cr = cairo_create(tabData->image);
-
-		cairo_surface_t *first;
-		first = cairo_surface_create_similar(cairo_get_target(cr),
+		source_image = tabData->image;
+		cairo_surface_flush(source_image);
+		scaled_image = cairo_surface_create_similar(source_image,
 				CAIRO_CONTENT_COLOR, tabData->XSize, tabData->YSize);
-
-		cairo_t *first_cr;
-		first_cr = cairo_create(first);
-		cairo_scale(first_cr, Scale, Scale);
-		cairo_set_source_surface(first_cr, tabData->image, 0, 0);
-		cairo_paint(first_cr);
-		tabData->image = first;
-
-		cairo_destroy(first_cr);
+		scaled_cr = cairo_create(scaled_image);
+		cairo_scale(scaled_cr, Scale, Scale);
+		cairo_set_source_surface(scaled_cr, source_image, 0, 0);
+		cairo_paint(scaled_cr);
+		cairo_destroy(scaled_cr);
+		cairo_surface_destroy(source_image);
+		tabData->image = scaled_image;
 	}
 
 	tabData->drawing_area = gtk_drawing_area_new(); /* Create new drawing area */
+	gtk_widget_set_can_focus(tabData->drawing_area, TRUE);
 	tabData->viewOrigin[0] = MAIN_IMAGE_CANVAS_MIN_PAD;
 	tabData->viewOrigin[1] = MAIN_IMAGE_CANVAS_MIN_PAD;
 	tabData->viewCanvasSize[0] = tabData->XSize + 2.0 * MAIN_IMAGE_CANVAS_MIN_PAD;
@@ -2056,11 +2623,93 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 			cursor);
 	g_object_unref(cursor);
 
-	tabData->pendingInitialZoomToFit = TRUE;
+	tabData->zoomedToFit = TRUE;
+	tabData->fittedViewportWidth = -1;
+	tabData->fittedViewportHeight = -1;
 	g_idle_add(applyInitialZoomToFit, tabData);
 	debugDumpViewportState("addImageToTab:scheduled_initial_fit", tabData);
 
 	return 0;
+}
+
+static void applyCalibrationToTab(struct TabData *tabData,
+		const CalibrationState *calibration) {
+	gint i;
+	gchar buffer[64];
+
+	tabData->loadingStore = TRUE;
+	for (i = 0; i < G3_AXIS_POINT_COUNT; i++) {
+		tabData->axiscoords[i][0] = calibration->axis_x[i];
+		tabData->axiscoords[i][1] = calibration->axis_y[i];
+		tabData->realcoords[i] = calibration->axis_value[i];
+		tabData->bpressed[i] = calibration->position_set[i];
+		tabData->valueset[i] = calibration->value_set[i];
+		gtk_widget_set_sensitive(tabData->xyentry[i],
+				calibration->position_set[i]);
+		gtk_editable_set_editable(GTK_EDITABLE(tabData->xyentry[i]),
+				calibration->position_set[i]);
+		if (calibration->value_set[i]) {
+			g_ascii_dtostr(buffer, sizeof(buffer), calibration->axis_value[i]);
+			gtk_entry_set_text(GTK_ENTRY(tabData->xyentry[i]), buffer);
+		} else {
+			gtk_entry_set_text(GTK_ENTRY(tabData->xyentry[i]), "");
+		}
+	}
+	for (i = 0; i < 2; i++) {
+		tabData->logxy[i] = calibration->log_axis[i];
+		gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tabData->logcheckbutton[i]),
+				calibration->log_axis[i]);
+	}
+	tabData->loadingStore = FALSE;
+	setButtonSensitivity(tabData);
+	refreshProcessingInformation(tabData);
+	triggerUpdateDrawArea(tabData->drawing_area);
+}
+
+static void restoreStoredDocument(struct TabData *tabData,
+		const gchar *filename) {
+	CalibrationState calibration;
+	DataSeries *series;
+	gchar *label;
+	gboolean existing;
+	gint64 image_id;
+	GError *error;
+
+	error = NULL;
+	image_id = 0;
+	existing = FALSE;
+	if (appDatastore != NULL
+			&& datastore_resolve_image(appDatastore, filename,
+					tabData->sourceXSize, tabData->sourceYSize, &image_id,
+					&existing, &error)) {
+		tabData->document->image_id = image_id;
+		if (!datastore_load_document(appDatastore, image_id, tabData->document,
+				&calibration, &error)) {
+			reportDatastoreError("restoring image data", error);
+			calibration_state_clear(&calibration);
+		}
+	} else {
+		reportDatastoreError("identifying the image", error);
+		calibration_state_clear(&calibration);
+	}
+
+	if (tabData->document->series->len == 0) {
+		label = image_document_next_series_label(tabData->document);
+		series = image_document_add_series(tabData->document, label,
+				image_document_next_color(tabData->document));
+		g_free(label);
+		if (appDatastore != NULL && image_id > 0) {
+			error = NULL;
+			if (!datastore_insert_series(appDatastore, image_id, series, &error)
+					|| !datastore_set_active_series(appDatastore, image_id,
+							series->id, &error))
+				reportDatastoreError("creating the first series", error);
+		}
+	}
+	applyCalibrationToTab(tabData, &calibration);
+	refreshSeriesWidgets(tabData);
+	syncActivePointCount(tabData);
+	(void) existing;
 }
 
 /****************************************************************/
@@ -2098,7 +2747,19 @@ static void updateFileChooserPreview(GtkFileChooser *file_chooser,
 }
 
 struct TabData * allocateTabMemory() {
-	return (struct TabData *) malloc(sizeof(struct TabData));
+	return g_new0(struct TabData, 1);
+}
+
+static void freeTabData(gpointer data) {
+	struct TabData *tabData;
+
+	tabData = (struct TabData *) data;
+	if (tabData == NULL)
+		return;
+	if (tabData->image != NULL)
+		cairo_surface_destroy(tabData->image);
+	image_document_free(tabData->document);
+	g_free(tabData);
 }
 
 /****************************************************************/
@@ -2114,16 +2775,15 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	GtkWidget *xy_label[4]; /* Labels for texts in window */
 	GtkWidget *logcheckb[2]; /* Logarithmic checkbuttons */
 	GtkWidget *nump_label, *ScrollWindow, *controls_scroll; /* Various widgets */
-	GtkWidget *APlabel, *PIlabel, *ZAlabel, *Llabel, *tab_label;
+	GtkWidget *APlabel, *PIlabel, *ZAlabel, *Llabel, *Slabel, *tab_label;
 	GtkWidget *alignment, *fixed;
 	GtkWidget *x_label, *y_label, *tmplabel;
-	GtkWidget *ordercheckb[ORDERBNUM], *UseErrCheckB,
-			*actioncheckb[ACTIONBNUM];
-	GtkWidget *Olabel, *Elabel, *Alabel;
 	GSList *group;
 	GtkWidget *dialog;
 	GtkWidget *pm_label, *pm_label2;
 	GtkWidget *drawing_area_alignment;
+	GtkWidget *series_buttons, *add_series_button, *add_mode_button;
+	gint controls_min_width, controls_natural_width;
 
 	gchar buf[256], buf2[256];
 	gint i, TabNum;
@@ -2161,10 +2821,12 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	TabNum = gtk_notebook_append_page((GtkNotebook *) mainnotebook, table,
 			tab_label);
 	if (TabNum == -1) {
+		g_free(tabData);
 		return -1;
 	}
 
-	g_object_set_data(G_OBJECT(table), DATA_STORE_NAME, (gpointer) tabData);
+	g_object_set_data_full(G_OBJECT(table), DATA_STORE_NAME, (gpointer) tabData,
+			freeTabData);
 
 	if (TempCoords != NULL) {
 		tabData->realcoords[0] = TempCoords[0];
@@ -2176,11 +2838,9 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 		tabData->logxy[0] = Uselogxy[0];
 		tabData->logxy[1] = Uselogxy[1];
 	}
-	if (UseError != NULL) {
-		tabData->UseErrors = *UseError;
-	} else {
-		tabData->UseErrors = FALSE;
-	}
+	if (UseError != NULL)
+		exportUseErrors = *UseError;
+	tabData->UseErrors = exportUseErrors;
 
 	/* Init datastructures */
 
@@ -2195,9 +2855,7 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	tabData->valueset[3] = FALSE;
 
 	tabData->numpoints = 0;
-	tabData->numlastpoints = 0;
-	tabData->ordering = 0;
-	tabData->Action = PRINT2STDOUT;
+	tabData->ordering = exportOrdering;
 
 	tabData->mousePointerCoords[0] = -1.0;
 	tabData->mousePointerCoords[1] = -1.0;
@@ -2208,23 +2866,36 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	tabData->viewCanvasSize[1] = 2.0 * MAIN_IMAGE_CANVAS_MIN_PAD;
 	tabData->XSize = 0;
 	tabData->YSize = 0;
+	tabData->sourceXSize = 0;
+	tabData->sourceYSize = 0;
+	tabData->imageScale = 1.0;
 
 	tabData->logxy[0] = FALSE;
 	tabData->logxy[1] = FALSE;
-
-	tabData->MaxPoints = MAXPOINTS;
 
 	tabData->setxypressed[0] = FALSE;
 	tabData->setxypressed[1] = FALSE;
 	tabData->setxypressed[2] = FALSE;
 	tabData->setxypressed[3] = FALSE;
 
-	tabData->lastpoints = NULL;
+	tabData->document = image_document_new(0);
+	tabData->loadingStore = FALSE;
+	tabData->editMode = FALSE;
+	tabData->movedPoint = NULL;
+	tabData->movedSeries = NULL;
+	tabData->series_combo = NULL;
+	tabData->series_label_entry = NULL;
+	tabData->series_color_button = NULL;
+	tabData->series_visible_check = NULL;
+	tabData->delete_series_button = NULL;
+	tabData->edit_mode_button = NULL;
+	tabData->selected_point_label = NULL;
 
-	tabData->movedPointIndex = NONESELECTED;
 	tabData->middlePanning = FALSE;
 	tabData->middlePanMoved = FALSE;
-	tabData->pendingInitialZoomToFit = FALSE;
+	tabData->zoomedToFit = FALSE;
+	tabData->fittedViewportWidth = -1;
+	tabData->fittedViewportHeight = -1;
 	tabData->pendingRecenterOnAdjust = FALSE;
 	tabData->pendingZoomScrollOnAdjust = FALSE;
 	tabData->pendingZoomScrollTarget[0] = 0.0;
@@ -2296,20 +2967,9 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 		gtk_widget_set_tooltip_text(tabData->setxybutton[i], setxytts[i]);
 	}
 
-	tabData->remlastbutton = gtk_button_new_with_mnemonic(RemLastBLabel); /* Create button */
-	g_signal_connect(G_OBJECT (tabData->remlastbutton), "clicked", /* Connect button */
-	G_CALLBACK (removeLastPoint), tabData);
-	gtk_widget_set_sensitive(tabData->remlastbutton, FALSE);
-	gtk_widget_set_tooltip_text(tabData->remlastbutton, removeltt);
-
-	tabData->remallbutton = gtk_button_new_with_mnemonic(RemAllBLabel); /* Create button */
-	g_signal_connect(G_OBJECT (tabData->remallbutton), "clicked", /* Connect button */
-	G_CALLBACK (removeAllPoints), tabData);
-	gtk_widget_set_sensitive(tabData->remallbutton, FALSE);
-	gtk_widget_set_tooltip_text(tabData->remallbutton, removeatts);
-
 	for (i = 0; i < 2; i++) {
 		logcheckb[i] = gtk_check_button_new_with_mnemonic(loglabel[i]); /* Create check button */
+		tabData->logcheckbutton[i] = logcheckb[i];
 		struct ButtonData *buttonData;
 		buttonData = malloc(sizeof(struct ButtonData));
 		buttonData->tabData = tabData;
@@ -2404,12 +3064,78 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	gtk_container_add(GTK_CONTAINER(controls_scroll), blvbox);
 
 	subvbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, ELEM_SEP);
-	gtk_box_pack_start(GTK_BOX (blvbox), subvbox, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX (subvbox), tabData->remlastbutton, FALSE, FALSE,
-			0); /* Pack button in vert. box */
-	gtk_box_pack_start(GTK_BOX (subvbox), tabData->remallbutton, FALSE, FALSE,
-			0); /* Pack button in vert. box */
+	gtk_box_pack_start(GTK_BOX(blvbox), subvbox, FALSE, FALSE, 0);
+	Slabel = gtk_label_new(NULL);
+	gtk_label_set_markup(GTK_LABEL(Slabel), "<b>Data series</b>");
+	gtk_widget_set_halign(Slabel, GTK_ALIGN_START);
+	gtk_box_pack_start(GTK_BOX(subvbox), Slabel, FALSE, FALSE, 0);
 
+	tabData->series_combo = gtk_combo_box_text_new();
+	gtk_widget_set_tooltip_text(tabData->series_combo,
+			"Choose the series that receives new points and is exported");
+	g_signal_connect(tabData->series_combo, "changed",
+			G_CALLBACK(activeSeriesChanged), tabData);
+	gtk_box_pack_start(GTK_BOX(subvbox), tabData->series_combo, FALSE, FALSE, 0);
+
+	series_buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, ELEM_SEP);
+	add_series_button = gtk_button_new_with_mnemonic("_New series");
+	tabData->delete_series_button = gtk_button_new_with_mnemonic("Delete s_eries");
+	g_signal_connect(add_series_button, "clicked", G_CALLBACK(addSeries), tabData);
+	g_signal_connect(tabData->delete_series_button, "clicked",
+			G_CALLBACK(deleteSeries), tabData);
+	gtk_box_pack_start(GTK_BOX(series_buttons), add_series_button, TRUE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(series_buttons), tabData->delete_series_button,
+			TRUE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(subvbox), series_buttons, FALSE, FALSE, 0);
+
+	tabData->series_label_entry = gtk_entry_new();
+	gtk_entry_set_placeholder_text(GTK_ENTRY(tabData->series_label_entry),
+			"Series label");
+	gtk_widget_set_tooltip_text(tabData->series_label_entry,
+			"Label for the active series");
+	g_signal_connect(tabData->series_label_entry, "changed",
+			G_CALLBACK(seriesLabelChanged), tabData);
+	gtk_box_pack_start(GTK_BOX(subvbox), tabData->series_label_entry, FALSE,
+			FALSE, 0);
+
+	series_buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, ELEM_SEP);
+	tabData->series_color_button = gtk_color_button_new();
+	gtk_color_chooser_set_use_alpha(GTK_COLOR_CHOOSER(tabData->series_color_button),
+			FALSE);
+	gtk_widget_set_tooltip_text(tabData->series_color_button,
+			"Marker colour for the active series");
+	g_signal_connect(tabData->series_color_button, "color-set",
+			G_CALLBACK(seriesColorChanged), tabData);
+	tabData->series_visible_check = gtk_check_button_new_with_mnemonic("_Visible");
+	g_signal_connect(tabData->series_visible_check, "toggled",
+			G_CALLBACK(seriesVisibilityChanged), tabData);
+	gtk_box_pack_start(GTK_BOX(series_buttons), tabData->series_color_button,
+			FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(series_buttons), tabData->series_visible_check,
+			FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(subvbox), series_buttons, FALSE, FALSE, 0);
+
+	group = NULL;
+	add_mode_button = gtk_radio_button_new_with_label(group, "Add points");
+	group = gtk_radio_button_get_group(GTK_RADIO_BUTTON(add_mode_button));
+	tabData->edit_mode_button = gtk_radio_button_new_with_label(group,
+			"Select / edit points");
+	gtk_widget_set_tooltip_text(tabData->edit_mode_button,
+			"Select or drag markers; Shift-click adds or removes points from the selection");
+	g_signal_connect(add_mode_button, "toggled", G_CALLBACK(addModeChanged),
+			tabData);
+	g_signal_connect(tabData->edit_mode_button, "toggled",
+			G_CALLBACK(editModeChanged), tabData);
+	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(add_mode_button), TRUE);
+	gtk_box_pack_start(GTK_BOX(subvbox), add_mode_button, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(subvbox), tabData->edit_mode_button, FALSE, FALSE,
+			0);
+
+	tabData->selected_point_label = gtk_label_new("No point selected");
+	gtk_label_set_xalign(GTK_LABEL(tabData->selected_point_label), 0.0);
+	gtk_label_set_line_wrap(GTK_LABEL(tabData->selected_point_label), TRUE);
+	gtk_box_pack_start(GTK_BOX(subvbox), tabData->selected_point_label, FALSE,
+			FALSE, 0);
 	subvbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, ELEM_SEP);
 	tabData->zoomareabox = subvbox;
 	gtk_box_pack_start(GTK_BOX (blvbox), subvbox, FALSE, FALSE, 0);
@@ -2436,113 +3162,25 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 		gtk_box_pack_start(GTK_BOX (subvbox), fixed, FALSE, FALSE, 0); /* Pack checkbutton in vert. box */
 	}
 
-	group = NULL;
-	for (i = 0; i < ORDERBNUM; i++) {
-		ordercheckb[i] = gtk_radio_button_new_with_label(group, orderlabel[i]); /* Create radio button */
-		struct ButtonData *buttonData;
-		buttonData = malloc(sizeof(struct ButtonData));
-		buttonData->tabData = tabData;
-		buttonData->index = i;
-		g_signal_connect(G_OBJECT (ordercheckb[i]), "toggled", /* Connect button */
-		G_CALLBACK (setOutputOrdering), buttonData);
-		group = gtk_radio_button_get_group(GTK_RADIO_BUTTON (ordercheckb[i])); /* Get buttons group */
-	}
-	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON (ordercheckb[0]), TRUE); /* Set no ordering button active */
-
-	subvbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, ELEM_SEP);
-	tabData->oppropbox = subvbox;
-	gtk_box_pack_start(GTK_BOX (blvbox), subvbox, FALSE, FALSE, 0);
-	Olabel = gtk_label_new(NULL);
-	gtk_label_set_markup(GTK_LABEL (Olabel), Oheader);
-	alignment = g3AlignmentNew(0, 1, 0, 0);
-	gtk_container_add((GtkContainer *) alignment, Olabel);
-	gtk_box_pack_start(GTK_BOX (subvbox), alignment, FALSE, FALSE, 0);
-	for (i = 0; i < ORDERBNUM; i++) {
-		fixed = gtk_fixed_new();
-		gtk_fixed_put((GtkFixed *) fixed, ordercheckb[i], FRAME_INDENT, 0);
-		gtk_box_pack_start(GTK_BOX (subvbox), fixed, FALSE, FALSE, 0); /* Pack radiobutton in vert. box */
-	}
-
-	UseErrCheckB = gtk_check_button_new_with_mnemonic(PrintErrCBLabel);
-	g_signal_connect(G_OBJECT (UseErrCheckB), "toggled",
-			G_CALLBACK (setPrintErrorUsage), tabData);
-	gtk_widget_set_tooltip_text(UseErrCheckB, uetts);
-	gtk_toggle_button_set_active((GtkToggleButton *) UseErrCheckB,
-			tabData->UseErrors);
-
-	Elabel = gtk_label_new(NULL);
-	gtk_label_set_markup(GTK_LABEL (Elabel), Eheader);
-	alignment = g3AlignmentNew(0, 1, 0, 0);
-	gtk_container_add((GtkContainer *) alignment, Elabel);
-	gtk_box_pack_start(GTK_BOX (subvbox), alignment, FALSE, FALSE, 0);
-	fixed = gtk_fixed_new();
-	gtk_fixed_put((GtkFixed *) fixed, UseErrCheckB, FRAME_INDENT, 0);
-	gtk_box_pack_start(GTK_BOX (subvbox), fixed, FALSE, FALSE, 0);
-
-	subvbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, ELEM_SEP);
-	gtk_box_pack_start(GTK_BOX (blvbox), subvbox, FALSE, FALSE, 0);
-	group = NULL;
-	for (i = 0; i < ACTIONBNUM; i++) {
-		actioncheckb[i] = gtk_radio_button_new_with_label(group,
-				actionlabel[i]); /* Create radio button */
-		struct ButtonData *buttonData;
-		buttonData = malloc(sizeof(struct ButtonData));
-		buttonData->tabData = tabData;
-		buttonData->index = i;
-		g_signal_connect(G_OBJECT (actioncheckb[i]), "toggled", /* Connect button */
-		G_CALLBACK (setOutputAction), buttonData);
-		group = gtk_radio_button_get_group(GTK_RADIO_BUTTON (actioncheckb[i])); /* Get buttons group */
-	}
-	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON (actioncheckb[0]), TRUE); /* Set no ordering button active */
-
-	Alabel = gtk_label_new(NULL);
-	gtk_label_set_markup(GTK_LABEL (Alabel), Aheader);
-	alignment = g3AlignmentNew(0, 1, 0, 0);
-	gtk_container_add((GtkContainer *) alignment, Alabel);
-	gtk_box_pack_start(GTK_BOX (subvbox), alignment, FALSE, FALSE, 0);
-	for (i = 0; i < ACTIONBNUM; i++) {
-		fixed = gtk_fixed_new();
-		gtk_fixed_put((GtkFixed *) fixed, actioncheckb[i], FRAME_INDENT, 0);
-		gtk_box_pack_start(GTK_BOX (subvbox), fixed, FALSE, FALSE, 0);
-	}
-
-	tabData->file_entry = gtk_entry_new(); /* Create text entry */
-	gtk_entry_set_max_length(GTK_ENTRY (tabData->file_entry), 256);
-	gtk_editable_set_editable((GtkEditable *) tabData->file_entry, TRUE);
-	g_signal_connect(G_OBJECT (tabData->file_entry), "changed", /* Init the entry to call */
-	G_CALLBACK (readFileEntry), tabData);
-	gtk_widget_set_tooltip_text(tabData->file_entry, filenamett);
-
 	if (FileInCwd) {
-		snprintf(buf2, 256, "%s.dat", basename(filename));
 		strncpy(tabData->FileNames, basename(filename), 256);
 	} else {
-		snprintf(buf2, 256, "%s.dat", filename);
 		strncpy(tabData->FileNames, filename, 256);
 	}
 
 	snprintf(buf, 256, Window_Title, tabData->FileNames); /* Print window title in buffer */
 	gtk_window_set_title(GTK_WINDOW (window), buf); /* Set window title */
 
-	fixed = gtk_fixed_new();
-	gtk_fixed_put((GtkFixed *) fixed, tabData->file_entry, FRAME_INDENT, 0);
-	gtk_box_pack_start(GTK_BOX (subvbox), fixed, FALSE, FALSE, 0);
-	gtk_widget_set_sensitive(tabData->file_entry, FALSE);
 
-	tabData->exportbutton = gtk_button_new_with_mnemonic(PrintBLabel); /* Create button */
-
-	gtk_box_pack_start(GTK_BOX (subvbox), tabData->exportbutton, FALSE, FALSE,
-			0);
-	gtk_widget_set_sensitive(tabData->exportbutton, FALSE);
-
-	g_signal_connect(G_OBJECT (tabData->exportbutton), "clicked",
-			G_CALLBACK (outputResultset), tabData);
-	gtk_widget_set_tooltip_text(tabData->exportbutton, printrestt);
+	/* A scrolled window does not normally propagate its child's width. Use the
+	 * completed controls' natural width without tying it to the wider axis grid. */
+	gtk_widget_get_preferred_width(blvbox, &controls_min_width,
+			&controls_natural_width);
+	gtk_scrolled_window_set_min_content_width(
+			GTK_SCROLLED_WINDOW(controls_scroll), controls_natural_width);
 
 	brvbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, GROUP_SEP);
 	gtk_box_pack_start(GTK_BOX (bottomhbox), brvbox, TRUE, TRUE, 0);
-
-	gtk_entry_set_text(GTK_ENTRY (tabData->file_entry), buf2); /* Set text of text entry to filename */
 
 	ScrollWindow = gtk_scrolled_window_new(NULL, NULL);
 	gtk_scrolled_window_set_policy((GtkScrolledWindow *) ScrollWindow,
@@ -2566,6 +3204,12 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	gtk_container_add(GTK_CONTAINER (tabData->ViewPort),
 			drawing_area_alignment);
 	gtk_container_add(GTK_CONTAINER (ScrollWindow), tabData->ViewPort);
+	g_signal_connect(gtk_scrolled_window_get_hscrollbar(
+			GTK_SCROLLED_WINDOW(ScrollWindow)), "change-value",
+			G_CALLBACK(scrollbarChangeValue), tabData);
+	g_signal_connect(gtk_scrolled_window_get_vscrollbar(
+			GTK_SCROLLED_WINDOW(ScrollWindow)), "change-value",
+			G_CALLBACK(scrollbarChangeValue), tabData);
 
 	gtk_widget_show_all(window);
 
@@ -2577,14 +3221,15 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 		return -1;
 	}
 
+	restoreStoredDocument(tabData, filename);
+
 	if (UsePreSetCoords) {
-		allocatePointDataMemory(tabData);
 		tabData->axiscoords[0][0] = 0;
-		tabData->axiscoords[0][1] = tabData->YSize - 1;
-		tabData->axiscoords[1][0] = tabData->XSize - 1;
-		tabData->axiscoords[1][1] = tabData->YSize - 1;
+		tabData->axiscoords[0][1] = tabData->sourceYSize - 1;
+		tabData->axiscoords[1][0] = tabData->sourceXSize - 1;
+		tabData->axiscoords[1][1] = tabData->sourceYSize - 1;
 		tabData->axiscoords[2][0] = 0;
-		tabData->axiscoords[2][1] = tabData->YSize - 1;
+		tabData->axiscoords[2][1] = tabData->sourceYSize - 1;
 		tabData->axiscoords[3][0] = 0;
 		tabData->axiscoords[3][1] = 0;
 		for (i = 0; i < 4; i++) {
@@ -2593,13 +3238,19 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 					TRUE);
 			sprintf(buf, "%lf", tabData->realcoords[i]);
 			gtk_entry_set_text((GtkEntry *) tabData->xyentry[i], buf);
-			tabData->lastpoints[tabData->numlastpoints] = -(i + 1);
-			tabData->numlastpoints++;
 			tabData->valueset[i] = TRUE;
 			tabData->bpressed[i] = TRUE;
 			tabData->setxypressed[i] = FALSE;
 		}
-		gtk_widget_set_sensitive(tabData->exportbutton, TRUE);
+		if (Uselogxy != NULL) {
+			for (i = 0; i < 2; i++) {
+				tabData->logxy[i] = Uselogxy[i];
+				gtk_toggle_button_set_active(
+						GTK_TOGGLE_BUTTON(tabData->logcheckbutton[i]), Uselogxy[i]);
+			}
+		}
+		persistCalibration(tabData);
+		setButtonSensitivity(tabData);
 	}
 
 	gtk_widget_set_sensitive(close_menu_item, TRUE);
@@ -2613,11 +3264,6 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 		if (tabData->logbox != NULL
 		)
 			gtk_widget_hide(tabData->logbox);
-	if (HideOpProp)
-		if (tabData->oppropbox != NULL
-		)
-			gtk_widget_hide(tabData->oppropbox);
-
 	addRecentFile(filename);
 
 	return 0;
@@ -2768,7 +3414,6 @@ GCallback menuHelpAbout(void) {
 /* destroyed.							*/
 /****************************************************************/
 GCallback menuTabClose(void) {
-	gint i;
 	gint page_num = gtk_notebook_get_current_page((GtkNotebook *) mainnotebook);
 	GtkWidget *page;
 
@@ -2791,19 +3436,10 @@ GCallback menuTabClose(void) {
 
 	gtk_notebook_remove_page((GtkNotebook *) mainnotebook, page_num); /* This appearently takes care of everything */
 
-	//	printf("Freeing memory for tab %s\n", tabData->FileNames);
-
-	if (tabData->lastpoints != NULL) {
-		for (i = 0; i < tabData->MaxPoints; i++) {
-			free(tabData->points[i]);
-		}
-		free(tabData->points);
-		free(tabData->lastpoints);
-	}
-	free(tabData);
-
 	if (countDataTabs() == 0)
 		gtk_widget_set_sensitive(close_menu_item, FALSE);
+	updateExportMenuSensitivity(getCurrentTabData());
+	updateEditMenuSensitivity(getCurrentTabData());
 	showStartPageIfNeeded();
 
 	return NULL;
@@ -2835,13 +3471,179 @@ static struct TabData *getCurrentTabData(void) {
 	return (struct TabData *) g_object_get_data(G_OBJECT(page), DATA_STORE_NAME);
 }
 
+static gboolean documentHasAnyPoints(const ImageDocument *document) {
+	guint i;
+
+	if (document == NULL)
+		return FALSE;
+	for (i = 0; i < document->series->len; i++) {
+		DataSeries *series;
+		series = g_ptr_array_index(document->series, i);
+		if (series->points->len > 0)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static void updateExportMenuSensitivity(struct TabData *tabData) {
+	gboolean calibrated, current_ready, all_ready;
+	DataSeries *series;
+
+	calibrated = tabData != NULL && calibrationIsComplete(tabData);
+	series = tabData != NULL ? activeSeries(tabData) : NULL;
+	current_ready = calibrated && series != NULL && series->points->len > 0;
+	all_ready = calibrated && tabData->document != NULL
+			&& documentHasAnyPoints(tabData->document);
+	if (export_current_menu_item != NULL)
+		gtk_widget_set_sensitive(export_current_menu_item, current_ready);
+	if (export_all_menu_item != NULL)
+		gtk_widget_set_sensitive(export_all_menu_item, all_ready);
+}
+
+static void updateEditMenuSensitivity(struct TabData *tabData) {
+	DataSeries *series;
+	gboolean has_points;
+	guint selection_count;
+
+	series = tabData != NULL ? activeSeries(tabData) : NULL;
+	has_points = series != NULL && series->points->len > 0;
+	selection_count = tabData != NULL && tabData->document != NULL
+			? image_document_selection_count(tabData->document) : 0;
+	if (remove_last_menu_item != NULL)
+		gtk_widget_set_sensitive(remove_last_menu_item, has_points);
+	if (clear_series_menu_item != NULL)
+		gtk_widget_set_sensitive(clear_series_menu_item, has_points);
+	if (delete_selected_menu_item != NULL) {
+		gtk_menu_item_set_label(GTK_MENU_ITEM(delete_selected_menu_item),
+				selection_count == 1 ? "_Delete selected point"
+						: "_Delete selected points");
+		gtk_widget_set_sensitive(delete_selected_menu_item, selection_count > 0);
+	}
+}
+
+static void removeLastPointFromMenu(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData;
+
+	(void) data;
+	tabData = getCurrentTabData();
+	if (tabData != NULL)
+		removeLastPoint(widget, tabData);
+}
+
+static void clearSeriesFromMenu(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData;
+
+	(void) data;
+	tabData = getCurrentTabData();
+	if (tabData != NULL)
+		removeAllPoints(widget, tabData);
+}
+
+static void deleteSelectedFromMenu(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData;
+
+	(void) data;
+	tabData = getCurrentTabData();
+	if (tabData != NULL)
+		deleteSelectedPoint(widget, tabData);
+}
+
+static void showExportError(const gchar *message) {
+	GtkWidget *dialog;
+
+	dialog = gtk_message_dialog_new(GTK_WINDOW(window),
+			GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+			GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "%s", message);
+	gtk_dialog_run(GTK_DIALOG(dialog));
+	gtk_widget_destroy(dialog);
+}
+
+static gchar *suggestedExportName(struct TabData *tabData,
+		gboolean all_series) {
+	gchar *base, *name;
+
+	base = g_path_get_basename(tabData->FileNames);
+	name = g_strdup_printf("%s%s.dat", base, all_series ? "-all" : "");
+	g_free(base);
+	return name;
+}
+
+static void exportFromMenu(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData;
+	GString *output;
+	GtkWidget *dialog;
+	GtkClipboard *clipboard;
+	ExportTarget target;
+	gboolean all_series;
+	gint request;
+
+	(void) widget;
+	request = GPOINTER_TO_INT(data);
+	all_series = request / EXPORT_TARGET_COUNT != 0;
+	target = (ExportTarget) (request % EXPORT_TARGET_COUNT);
+	tabData = getCurrentTabData();
+	if (tabData == NULL)
+		return;
+	output = formatResultset(tabData, all_series,
+			target == EXPORT_TO_CLIPBOARD);
+	if (output == NULL)
+		return;
+
+	switch (target) {
+	case EXPORT_TO_FILE: {
+		gchar *filename, *suggested_name;
+		GError *error;
+
+		dialog = gtk_file_chooser_dialog_new(
+				all_series ? "Export all series" : "Export current series",
+				GTK_WINDOW(window), GTK_FILE_CHOOSER_ACTION_SAVE,
+				"_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT,
+				NULL);
+		gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dialog),
+				TRUE);
+		suggested_name = suggestedExportName(tabData, all_series);
+		gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), suggested_name);
+		g_free(suggested_name);
+		if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+			filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+			error = NULL;
+			if (!g_file_set_contents(filename, output->str, output->len, &error)) {
+				gchar *message;
+				message = g_strdup_printf("Could not export to ‘%s’: %s", filename,
+						error->message);
+				showExportError(message);
+				g_free(message);
+				g_error_free(error);
+			}
+			g_free(filename);
+		}
+		gtk_widget_destroy(dialog);
+		break;
+	}
+	case EXPORT_TO_CLIPBOARD:
+		clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+		/* Tabs and newlines paste directly as columns and rows in Calc. */
+		gtk_clipboard_set_text(clipboard, output->str, output->len);
+		gtk_clipboard_store(clipboard);
+		break;
+	case EXPORT_TO_STDOUT:
+	default:
+		fputs(output->str, stdout);
+		fflush(stdout);
+		break;
+	}
+	g_string_free(output, TRUE);
+}
+
 void zoomView100(GtkWidget *widget, gpointer data) {
 	struct TabData *tabData;
 	(void) widget;
 	(void) data;
 	tabData = getCurrentTabData();
-	if (tabData != NULL)
+	if (tabData != NULL) {
+		disableZoomToFit(tabData);
 		setMainImageZoom(tabData, 1.0, -1.0, -1.0);
+	}
 }
 
 void zoomView200(GtkWidget *widget, gpointer data) {
@@ -2849,8 +3651,10 @@ void zoomView200(GtkWidget *widget, gpointer data) {
 	(void) widget;
 	(void) data;
 	tabData = getCurrentTabData();
-	if (tabData != NULL)
+	if (tabData != NULL) {
+		disableZoomToFit(tabData);
 		setMainImageZoom(tabData, 2.0, -1.0, -1.0);
+	}
 }
 
 void zoomViewToFit(GtkWidget *widget, gpointer data) {
@@ -2858,8 +3662,11 @@ void zoomViewToFit(GtkWidget *widget, gpointer data) {
 	(void) widget;
 	(void) data;
 	tabData = getCurrentTabData();
-	if (tabData != NULL)
-		zoomToFitAndCenter(tabData);
+	if (tabData != NULL) {
+		disableZoomToFit(tabData);
+		tabData->zoomedToFit = TRUE;
+		applyStickyZoomToFit(tabData, TRUE);
+	}
 }
 
 /****************************************************************/
@@ -2913,31 +3720,6 @@ GCallback hideAxisSettings(GtkWidget *widget, gpointer func_data) {
 }
 
 /****************************************************************/
-/* This callback handles the hide output properties toggling.	*/
-/****************************************************************/
-GCallback hideOutputProperties(GtkWidget *widget, gpointer func_data) {
-	int i;
-	struct TabData *tabData;
-
-	for (i = 0; i < gtk_notebook_get_n_pages((GtkNotebook *) mainnotebook);
-			i++) {
-		tabData = (struct TabData *) g_object_get_data(
-				G_OBJECT(gtk_notebook_get_nth_page((GtkNotebook *) mainnotebook,
-								i)), DATA_STORE_NAME);
-		if (tabData == NULL)
-			continue;
-		if (gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(widget))) {
-			gtk_widget_hide(tabData->oppropbox);
-		} else {
-			gtk_widget_show(tabData->oppropbox);
-		}
-	}
-	HideOpProp = gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(widget));
-
-	return NULL;
-}
-
-/****************************************************************/
 /* This callback is called when the notebook page is changed.	*/
 /* It sets up the ViewedTabNum value as well as the title of	*/
 /* the window to match the image currently viewed.		*/
@@ -2953,8 +3735,10 @@ GCallback notebookTabSwitchEventHandler(GtkNotebook *notebook, GtkWidget *page,
 	if (tabData != NULL) {
 		sprintf(buf, Window_Title, tabData->FileNames); /* Print window title in buffer */
 		gtk_window_set_title(GTK_WINDOW (window), buf); /* Set window title */
+		setButtonSensitivity(tabData);
 	} else {
 		gtk_window_set_title(GTK_WINDOW(window), Window_Title_NoneOpen);
+		updateExportMenuSensitivity(NULL);
 	}
 	return NULL;
 }
@@ -2974,16 +3758,25 @@ int main(int argc, char **argv) {
 	GtkWidget *mainvbox;
 
 	GtkWidget *menubar;
-	GtkWidget *file_menu, *view_menu, *help_menu;
-	GtkWidget *file_root_item, *view_root_item, *help_root_item;
+	GtkWidget *file_menu, *edit_menu, *view_menu, *help_menu;
+	GtkWidget *file_root_item, *edit_root_item, *view_root_item, *help_root_item;
 	GtkWidget *open_item, *quit_item, *about_item;
-	GtkWidget *zoom_area_item, *axis_settings_item, *output_properties_item;
+	GtkWidget *export_current_menu, *export_all_menu, *export_destination_item;
+	GtkWidget *ordering_menu_item, *ordering_menu, *ordering_item[ORDERBNUM];
+	GtkWidget *include_errors_item;
+	GtkWidget *zoom_area_item, *axis_settings_item;
 	GtkWidget *fullscreen_item;
 	GtkWidget *zoom100_item, *zoom200_item, *zoomfit_item;
 	GtkWidget *separator_item, *separator_item2;
 	GtkAccelGroup *accel_group;
+	const gchar *export_destination_labels[EXPORT_TARGET_COUNT] = {
+		"To _stdout", "To _file…", "_Copy to clipboard"
+	};
+	gint scope, target;
+	GSList *ordering_group;
 
 	gtk_init(&argc, &argv); /* Init GTK */
+	loadExportPreferences();
 
 	if (argc > 1)
 		if (strcmp(argv[1], "-h") == 0 || /* If no parameters given, -h or --help */
@@ -2995,7 +3788,7 @@ int main(int argc, char **argv) {
 	maxX = -1;
 	maxY = -1;
 	Scale = -1;
-	UseError = FALSE;
+	UseError = exportUseErrors;
 	UsePreSetCoords = FALSE;
 	Uselogxy[0] = FALSE;
 	Uselogxy[1] = FALSE;
@@ -3060,12 +3853,6 @@ int main(int argc, char **argv) {
 				i += 4;
 				if (i >= argc)
 					break;
-				/*	    } else if (strcmp(argv[i],"-hidelog")==0) {
-				 HideLog = TRUE;
-				 } else if (strcmp(argv[i],"-hideza")==0) {
-				 HideZoomArea = TRUE;
-				 } else if (strcmp(argv[i],"-hideop")==0) {
-				 HideOpProp = TRUE; */
 			} else {
 				printf("Unknown parameter : %s\n", argv[i]);
 				exit(0);
@@ -3075,6 +3862,16 @@ int main(int argc, char **argv) {
 			FileIndex[NumFiles] = i;
 			NumFiles++;
 		}
+	}
+	exportUseErrors = UseError;
+
+	{
+		GError *database_error;
+		database_error = NULL;
+		appDatastore = datastore_open_default(&database_error);
+		if (appDatastore == NULL)
+			reportDatastoreError("opening the data store; continuing without persistence",
+					database_error);
 	}
 
 	window = gtk_window_new(GTK_WINDOW_TOPLEVEL); /* Create window */
@@ -3105,25 +3902,86 @@ int main(int argc, char **argv) {
 
 	menubar = gtk_menu_bar_new();
 	file_menu = gtk_menu_new();
+	edit_menu = gtk_menu_new();
 	view_menu = gtk_menu_new();
 	help_menu = gtk_menu_new();
 	file_menu_widget = file_menu;
 	recent_menu_items = g_ptr_array_new();
 
 	file_root_item = gtk_menu_item_new_with_mnemonic("_File");
+	edit_root_item = gtk_menu_item_new_with_mnemonic("_Edit");
 	view_root_item = gtk_menu_item_new_with_mnemonic("_View");
 	help_root_item = gtk_menu_item_new_with_mnemonic("_Help");
 
 	gtk_menu_item_set_submenu(GTK_MENU_ITEM(file_root_item), file_menu);
+	gtk_menu_item_set_submenu(GTK_MENU_ITEM(edit_root_item), edit_menu);
 	gtk_menu_item_set_submenu(GTK_MENU_ITEM(view_root_item), view_menu);
 	gtk_menu_item_set_submenu(GTK_MENU_ITEM(help_root_item), help_menu);
 
 	open_item = gtk_menu_item_new_with_mnemonic("_Open");
+	export_current_menu_item = gtk_menu_item_new_with_mnemonic(
+			"Export _current series");
+	export_all_menu_item = gtk_menu_item_new_with_mnemonic("Export _all series");
 	close_menu_item = gtk_menu_item_new_with_mnemonic("_Close");
 	quit_item = gtk_menu_item_new_with_mnemonic("_Quit");
 	gtk_widget_set_sensitive(close_menu_item, FALSE);
 
 	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), open_item);
+	separator_item = gtk_separator_menu_item_new();
+	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), separator_item);
+
+	ordering_menu_item = gtk_menu_item_new_with_mnemonic("Point _ordering");
+	ordering_menu = gtk_menu_new();
+	gtk_menu_item_set_submenu(GTK_MENU_ITEM(ordering_menu_item), ordering_menu);
+	ordering_group = NULL;
+	for (i = 0; i < ORDERBNUM; i++) {
+		ordering_item[i] = gtk_radio_menu_item_new_with_label(ordering_group,
+				orderlabel[i]);
+		ordering_group = gtk_radio_menu_item_get_group(
+				GTK_RADIO_MENU_ITEM(ordering_item[i]));
+		gtk_menu_shell_append(GTK_MENU_SHELL(ordering_menu), ordering_item[i]);
+		gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(ordering_item[i]),
+				i == exportOrdering);
+		g_signal_connect(ordering_item[i], "toggled",
+				G_CALLBACK(exportOrderingChanged), GINT_TO_POINTER(i));
+	}
+	include_errors_item = gtk_check_menu_item_new_with_mnemonic(
+			"Include value _errors");
+	gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(include_errors_item),
+			exportUseErrors);
+	g_signal_connect(include_errors_item, "toggled",
+			G_CALLBACK(exportErrorsChanged), NULL);
+	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), ordering_menu_item);
+	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), include_errors_item);
+	separator_item = gtk_separator_menu_item_new();
+	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), separator_item);
+
+	for (scope = 0; scope < 2; scope++) {
+		GtkWidget *scope_menu;
+		scope_menu = gtk_menu_new();
+		for (target = 0; target < EXPORT_TARGET_COUNT; target++) {
+			export_destination_item = gtk_menu_item_new_with_mnemonic(
+					export_destination_labels[target]);
+			gtk_menu_shell_append(GTK_MENU_SHELL(scope_menu),
+					export_destination_item);
+			g_signal_connect(export_destination_item, "activate",
+					G_CALLBACK(exportFromMenu),
+					GINT_TO_POINTER(scope * EXPORT_TARGET_COUNT + target));
+		}
+		if (scope == 0) {
+			export_current_menu = scope_menu;
+			gtk_menu_item_set_submenu(GTK_MENU_ITEM(export_current_menu_item),
+					export_current_menu);
+		} else {
+			export_all_menu = scope_menu;
+			gtk_menu_item_set_submenu(GTK_MENU_ITEM(export_all_menu_item),
+					export_all_menu);
+		}
+	}
+	gtk_widget_set_sensitive(export_current_menu_item, FALSE);
+	gtk_widget_set_sensitive(export_all_menu_item, FALSE);
+	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), export_current_menu_item);
+	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), export_all_menu_item);
 	separator_item = gtk_separator_menu_item_new();
 	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), separator_item);
 	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), close_menu_item);
@@ -3134,10 +3992,23 @@ int main(int argc, char **argv) {
 	loadRecentFiles();
 	rebuildRecentFileMenu();
 
+	remove_last_menu_item = gtk_menu_item_new_with_mnemonic(
+			"_Remove last point");
+	clear_series_menu_item = gtk_menu_item_new_with_mnemonic(
+			"_Clear current series");
+	delete_selected_menu_item = gtk_menu_item_new_with_mnemonic(
+			"_Delete selected points");
+	gtk_widget_set_sensitive(remove_last_menu_item, FALSE);
+	gtk_widget_set_sensitive(clear_series_menu_item, FALSE);
+	gtk_widget_set_sensitive(delete_selected_menu_item, FALSE);
+	gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), remove_last_menu_item);
+	gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), clear_series_menu_item);
+	separator_item = gtk_separator_menu_item_new();
+	gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), separator_item);
+	gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), delete_selected_menu_item);
+
 	zoom_area_item = gtk_check_menu_item_new_with_label("Zoom area");
 	axis_settings_item = gtk_check_menu_item_new_with_label("Axis settings");
-	output_properties_item =
-			gtk_check_menu_item_new_with_label("Output properties");
 	fullscreen_item = gtk_check_menu_item_new_with_mnemonic("_Full Screen");
 	zoom100_item = gtk_menu_item_new_with_label("Zoom 100%");
 	zoom200_item = gtk_menu_item_new_with_label("Zoom 200%");
@@ -3145,7 +4016,6 @@ int main(int argc, char **argv) {
 
 	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), zoom_area_item);
 	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), axis_settings_item);
-	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), output_properties_item);
 	separator_item = gtk_separator_menu_item_new();
 	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), separator_item);
 	gtk_menu_shell_append(GTK_MENU_SHELL(view_menu), zoom100_item);
@@ -3159,6 +4029,7 @@ int main(int argc, char **argv) {
 	gtk_menu_shell_append(GTK_MENU_SHELL(help_menu), about_item);
 
 	gtk_menu_shell_append(GTK_MENU_SHELL(menubar), file_root_item);
+	gtk_menu_shell_append(GTK_MENU_SHELL(menubar), edit_root_item);
 	gtk_menu_shell_append(GTK_MENU_SHELL(menubar), view_root_item);
 	gtk_menu_shell_append(GTK_MENU_SHELL(menubar), help_root_item);
 
@@ -3168,6 +4039,12 @@ int main(int argc, char **argv) {
 			G_CALLBACK(menuTabClose), NULL);
 	g_signal_connect(G_OBJECT(quit_item), "activate", G_CALLBACK(menuFileExit),
 			NULL);
+	g_signal_connect(remove_last_menu_item, "activate",
+			G_CALLBACK(removeLastPointFromMenu), NULL);
+	g_signal_connect(clear_series_menu_item, "activate",
+			G_CALLBACK(clearSeriesFromMenu), NULL);
+	g_signal_connect(delete_selected_menu_item, "activate",
+			G_CALLBACK(deleteSelectedFromMenu), NULL);
 	g_signal_connect(G_OBJECT(about_item), "activate", G_CALLBACK(menuHelpAbout),
 			NULL);
 
@@ -3175,8 +4052,6 @@ int main(int argc, char **argv) {
 			G_CALLBACK(hideZoomArea), NULL);
 	g_signal_connect(G_OBJECT(axis_settings_item), "toggled",
 			G_CALLBACK(hideAxisSettings), NULL);
-	g_signal_connect(G_OBJECT(output_properties_item), "toggled",
-			G_CALLBACK(hideOutputProperties), NULL);
 	g_signal_connect(G_OBJECT(fullscreen_item), "toggled",
 			G_CALLBACK(toggleFullscreen), NULL);
 	g_signal_connect(G_OBJECT(zoom100_item), "activate", G_CALLBACK(zoomView100),
@@ -3199,8 +4074,6 @@ int main(int argc, char **argv) {
 			GDK_KEY_F5, 0, GTK_ACCEL_VISIBLE);
 	gtk_widget_add_accelerator(axis_settings_item, "activate", accel_group,
 			GDK_KEY_F6, 0, GTK_ACCEL_VISIBLE);
-	gtk_widget_add_accelerator(output_properties_item, "activate", accel_group,
-			GDK_KEY_F7, 0, GTK_ACCEL_VISIBLE);
 	gtk_widget_add_accelerator(fullscreen_item, "activate", accel_group,
 			GDK_KEY_F11, 0, GTK_ACCEL_VISIBLE);
 	gtk_widget_add_accelerator(zoom100_item, "activate", accel_group, GDK_KEY_1,
@@ -3234,6 +4107,8 @@ int main(int argc, char **argv) {
 	showStartPageIfNeeded();
 
 	gtk_main(); /* This is where it all starts */
+	datastore_close(appDatastore);
+	appDatastore = NULL;
 
 	return (0); /* Exit. */
 }

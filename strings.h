@@ -92,10 +92,6 @@ gchar orderlabel[ORDERBNUM][40] = {"No ordering",
                                    "Based on X value",
                                    "Based on Y value"};
 
-gchar actionlabel[ACTIONBNUM][32] = {"Export data to stdout",
-			             "Export data to file",
-			             "Copy data to clipboard"};
-                                                                                                                                                                    
 gchar loglabel[LOGBNUM][32] = {"_X axis is logarithmic",
                                "_Y axis is logarithmic"};
 
@@ -103,14 +99,6 @@ gchar xy_label_text[4][32] = {"X<sub>1</sub> value : ",
                               "X<sub>2</sub> value : ",
                               "Y<sub>1</sub> value : ",
                               "Y<sub>2</sub> value : "};
-
-gchar PrintBLabel[] = 	"Export point _data";
-
-gchar RemLastBLabel[] = "_Remove last point";
-
-gchar RemAllBLabel[] = 	"Remove _all points";
-
-gchar PrintErrCBLabel[] = "Include _errors";
 
 gchar pm_string[] = 	" ± ";
 
@@ -126,10 +114,7 @@ gchar scale_string[] = "Scale image : ";
 gchar APheader[] = "<b>Axis points</b>";
 gchar PIheader[] = "<b>Processing information</b>";
 gchar ZAheader[] = "<b>Zoom area</b>";
-gchar Oheader[]  = "<b>Point ordering</b>";
-gchar Eheader[]  = "<b>Value errors</b>";
 gchar Lheader[]  = "<b>Logarithmic scales</b>";
-gchar Aheader[]  = "<b>Action</b>";
 
 /************************************************************************************************/
 /* 					TOOLTIPS 						*/
@@ -168,19 +153,8 @@ gchar entryy2tt[] =	"This entry should contain the value of the second y-axis po
 
 gchar *entryxytt[] = 	{&entryx1tt[0], &entryx2tt[0], &entryy1tt[0], &entryy2tt[0]};
 
-gchar removeltt[] =	"This button removes the last put out point";
-
-gchar removeatts[] =	"Remove all points";
 gchar removeatt[] =	"This button removes all put out points except the axispoints. If all "
 			"points are already removed a second click will also remove the axispoints.";
-
-gchar printrestt[] =	"Print data to stdout";
-
-gchar printfilett[] =	"Print data to file %s";
-
-gchar copyclipboardtt[] = "Copy data to the clipboard";
-
-gchar filenamett[] =	"This entry should contain the name of the file to print data to";
 
 gchar logxtt[] =	"If x-axis is logarithmic check this button";
 
@@ -188,7 +162,6 @@ gchar logytt[] =	"If y-axis is logarithmic check this button";
 
 gchar *logxytt[] = 	{&logxtt[0], &logytt[0]};
 
-gchar uetts[] = 	"Show the errors of the x and y values at printout";
 
 gchar uett[] =		"If you want the errors of the x value to be printed in column 3 and the error "
 			"of the y value to be printed in column 4 check this button.";

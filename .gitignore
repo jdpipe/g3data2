@@ -2,6 +2,8 @@
 manpage.*
 g3data2.1.gz
 g3data2
+test_datastore
+.test-datastore-passed
 .cproject
 .project
 Release/*

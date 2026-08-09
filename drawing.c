@@ -54,3 +54,36 @@ void drawMarker(cairo_t *cr, gint x, gint y, gint type) {
 		cairo_stroke(cr);
 	}
 }
+
+void drawSeriesMarker(cairo_t *cr, gdouble x, gdouble y, guint32 rgba,
+		gboolean active, gboolean hovered, gboolean selected) {
+	gdouble red, green, blue, alpha;
+	gdouble marker_size;
+
+	rgba_to_components(rgba, &red, &green, &blue, &alpha);
+	if (!active)
+		alpha *= 0.55;
+	marker_size = MARKERSIZE + (hovered ? 1.0 : 0.0);
+
+	if (selected) {
+		cairo_arc(cr, x, y, marker_size + 4.0, 0, 2.0 * G_PI);
+		cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.95);
+		cairo_set_line_width(cr, 4.0);
+		cairo_stroke(cr);
+		cairo_arc(cr, x, y, marker_size + 4.0, 0, 2.0 * G_PI);
+		cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.95);
+		cairo_set_line_width(cr, 1.5);
+		cairo_stroke(cr);
+	} else if (hovered) {
+		cairo_arc(cr, x, y, marker_size + 3.0, 0, 2.0 * G_PI);
+		cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.85);
+		cairo_set_line_width(cr, 2.0);
+		cairo_stroke(cr);
+	}
+
+	cairo_rectangle(cr, x - marker_size, y - marker_size,
+			marker_size * 2.0 + 1.0, marker_size * 2.0 + 1.0);
+	cairo_set_source_rgba(cr, red, green, blue, alpha);
+	cairo_set_line_width(cr, active ? 2.0 : 1.5);
+	cairo_stroke(cr);
+}
