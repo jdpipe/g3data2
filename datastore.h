@@ -22,6 +22,9 @@ Datastore *datastore_open(const gchar *path, GError **error);
 Datastore *datastore_open_default(GError **error);
 void datastore_close(Datastore *datastore);
 const gchar *datastore_get_path(const Datastore *datastore);
+gboolean datastore_begin(Datastore *datastore, GError **error);
+gboolean datastore_commit(Datastore *datastore, GError **error);
+void datastore_rollback(Datastore *datastore);
 
 gchar *datastore_hash_file(const gchar *filename, gint64 *byte_size,
 		GError **error);

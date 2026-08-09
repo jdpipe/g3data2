@@ -47,15 +47,60 @@ gint min(gint x, gint y) {
 /* This function calculates the true value of the point based	*/
 /* on the coordinates of the point on the bitmap.		*/
 /****************************************************************/
+gboolean calculateAxisPosition(gdouble x, gdouble y,
+		const struct TabData *tabData, gdouble *x_fraction,
+		gdouble *y_fraction) {
+	gdouble ux, uy, vx, vy, determinant, axis_scale;
+	gdouble px, py;
+
+	ux = tabData->axiscoords[1][0] - tabData->axiscoords[0][0];
+	uy = tabData->axiscoords[1][1] - tabData->axiscoords[0][1];
+	vx = tabData->axiscoords[3][0] - tabData->axiscoords[2][0];
+	vy = tabData->axiscoords[3][1] - tabData->axiscoords[2][1];
+	determinant = ux * vy - uy * vx;
+	axis_scale = hypot(ux, uy) * hypot(vx, vy);
+	if (axis_scale == 0.0 || fabs(determinant) <= 1e-12 * axis_scale)
+		return FALSE;
+
+	px = x - tabData->axiscoords[0][0];
+	py = y - tabData->axiscoords[0][1];
+	*x_fraction = (px * vy - py * vx) / determinant;
+	px = x - tabData->axiscoords[2][0];
+	py = y - tabData->axiscoords[2][1];
+	*y_fraction = (ux * py - uy * px) / determinant;
+	return TRUE;
+}
+
+gboolean calculateAxisGuides(gdouble x, gdouble y,
+		const struct TabData *tabData, gdouble x_axis_intersection[2],
+		gdouble y_axis_intersection[2]) {
+	gdouble x_fraction, y_fraction;
+	gdouble ux, uy, vx, vy;
+
+	if (!calculateAxisPosition(x, y, tabData, &x_fraction, &y_fraction))
+		return FALSE;
+	ux = tabData->axiscoords[1][0] - tabData->axiscoords[0][0];
+	uy = tabData->axiscoords[1][1] - tabData->axiscoords[0][1];
+	vx = tabData->axiscoords[3][0] - tabData->axiscoords[2][0];
+	vy = tabData->axiscoords[3][1] - tabData->axiscoords[2][1];
+	x_axis_intersection[0] = tabData->axiscoords[0][0] + x_fraction * ux;
+	x_axis_intersection[1] = tabData->axiscoords[0][1] + x_fraction * uy;
+	y_axis_intersection[0] = tabData->axiscoords[2][0] + y_fraction * vx;
+	y_axis_intersection[1] = tabData->axiscoords[2][1] + y_fraction * vy;
+	return TRUE;
+}
+
 struct PointValue calculatePointValue(gdouble Xpos, gdouble Ypos,
 		struct TabData *tabData) {
-	double alpha, beta, x21, x43, y21, y43, rlc[4]; /* Declare help variables */
+	double x_fraction, y_fraction, rlc[4];
+	double x_plus, y_plus, x_minus, y_minus;
 	struct PointValue pointValue;
 
-	x21 = tabData->axiscoords[1][0] - tabData->axiscoords[0][0]; /* Calculate deltax of x axis points */
-	y21 = tabData->axiscoords[1][1] - tabData->axiscoords[0][1]; /* Calculate deltay of x axis points */
-	x43 = tabData->axiscoords[3][0] - tabData->axiscoords[2][0]; /* Calculate deltax of y axis points */
-	y43 = tabData->axiscoords[3][1] - tabData->axiscoords[2][1]; /* Calculate deltay of y axis points */
+	pointValue.Xv = pointValue.Yv = NAN;
+	pointValue.Xerr = pointValue.Yerr = NAN;
+	if (!calculateAxisPosition(Xpos, Ypos, tabData, &x_fraction,
+			&y_fraction))
+		return pointValue;
 
 	if (tabData->logxy[0]) { /* If x axis is logarithmic, store	*/
 		rlc[0] = log(tabData->realcoords[0]); /* recalculated values in rlc.		*/
@@ -73,56 +118,41 @@ struct PointValue calculatePointValue(gdouble Xpos, gdouble Ypos,
 		rlc[3] = tabData->realcoords[3];
 	}
 
-	alpha = ((tabData->axiscoords[0][0] - Xpos)
-			- (tabData->axiscoords[0][1] - Ypos) * (x43 / y43)) / (x21
-			- ((y21 * x43) / y43));
-	beta = ((tabData->axiscoords[2][1] - Ypos)
-			- (tabData->axiscoords[2][0] - Xpos) * (y21 / x21)) / (y43
-			- ((x43 * y21) / x21));
-
 	if (tabData->logxy[0])
-		pointValue.Xv = exp(-alpha * (rlc[1] - rlc[0]) + rlc[0]);
+		pointValue.Xv = exp(x_fraction * (rlc[1] - rlc[0]) + rlc[0]);
 	else
-		pointValue.Xv = -alpha * (rlc[1] - rlc[0]) + rlc[0];
+		pointValue.Xv = x_fraction * (rlc[1] - rlc[0]) + rlc[0];
 
 	if (tabData->logxy[1])
-		pointValue.Yv = exp(-beta * (rlc[3] - rlc[2]) + rlc[2]);
+		pointValue.Yv = exp(y_fraction * (rlc[3] - rlc[2]) + rlc[2]);
 	else
-		pointValue.Yv = -beta * (rlc[3] - rlc[2]) + rlc[2];
+		pointValue.Yv = y_fraction * (rlc[3] - rlc[2]) + rlc[2];
 
-	alpha = ((tabData->axiscoords[0][0] - (Xpos + 1.0))
-			- (tabData->axiscoords[0][1] - (Ypos + 1.0)) * (x43 / y43))
-			/ (x21 - ((y21 * x43) / y43));
-	beta = ((tabData->axiscoords[2][1] - (Ypos + 1.0))
-			- (tabData->axiscoords[2][0] - (Xpos + 1.0)) * (y21 / x21))
-			/ (y43 - ((x43 * y21) / x21));
+	if (!calculateAxisPosition(Xpos + 1.0, Ypos + 1.0, tabData,
+			&x_plus, &y_plus)
+			|| !calculateAxisPosition(Xpos - 1.0, Ypos - 1.0, tabData,
+					&x_minus, &y_minus))
+		return pointValue;
 
 	if (tabData->logxy[0])
-		pointValue.Xerr = exp(-alpha * (rlc[1] - rlc[0]) + rlc[0]);
+		pointValue.Xerr = exp(x_plus * (rlc[1] - rlc[0]) + rlc[0]);
 	else
-		pointValue.Xerr = -alpha * (rlc[1] - rlc[0]) + rlc[0];
+		pointValue.Xerr = x_plus * (rlc[1] - rlc[0]) + rlc[0];
 
 	if (tabData->logxy[1])
-		pointValue.Yerr = exp(-beta * (rlc[3] - rlc[2]) + rlc[2]);
+		pointValue.Yerr = exp(y_plus * (rlc[3] - rlc[2]) + rlc[2]);
 	else
-		pointValue.Yerr = -beta * (rlc[3] - rlc[2]) + rlc[2];
-
-	alpha = ((tabData->axiscoords[0][0] - (Xpos - 1.0))
-			- (tabData->axiscoords[0][1] - (Ypos - 1.0)) * (x43 / y43))
-			/ (x21 - ((y21 * x43) / y43));
-	beta = ((tabData->axiscoords[2][1] - (Ypos - 1.0))
-			- (tabData->axiscoords[2][0] - (Xpos - 1.0)) * (y21 / x21))
-			/ (y43 - ((x43 * y21) / x21));
+		pointValue.Yerr = y_plus * (rlc[3] - rlc[2]) + rlc[2];
 
 	if (tabData->logxy[0])
-		pointValue.Xerr -= exp(-alpha * (rlc[1] - rlc[0]) + rlc[0]);
+		pointValue.Xerr -= exp(x_minus * (rlc[1] - rlc[0]) + rlc[0]);
 	else
-		pointValue.Xerr -= -alpha * (rlc[1] - rlc[0]) + rlc[0];
+		pointValue.Xerr -= x_minus * (rlc[1] - rlc[0]) + rlc[0];
 
 	if (tabData->logxy[1])
-		pointValue.Yerr -= exp(-beta * (rlc[3] - rlc[2]) + rlc[2]);
+		pointValue.Yerr -= exp(y_minus * (rlc[3] - rlc[2]) + rlc[2]);
 	else
-		pointValue.Yerr -= -beta * (rlc[3] - rlc[2]) + rlc[2];
+		pointValue.Yerr -= y_minus * (rlc[3] - rlc[2]) + rlc[2];
 
 	pointValue.Xerr = fabs(pointValue.Xerr / 4.0);
 	pointValue.Yerr = fabs(pointValue.Yerr / 4.0);

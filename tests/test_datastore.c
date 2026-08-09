@@ -6,12 +6,127 @@
 #include <string.h>
 
 #include "../datastore.h"
+#include "../history.h"
 #include "../main.h"
 
 static gchar *test_directory;
 static gchar *database_path;
 static gchar *image_path;
 static Datastore *datastore;
+static gint64 resolve_image(const gchar *path, gint width, gint height,
+		gboolean *existing);
+
+typedef struct {
+	gint delta;
+	gboolean fail;
+} TestHistoryChange;
+
+static gboolean apply_test_history_change(gpointer context, gpointer data,
+		gboolean forward, GError **error) {
+	gint *value = context;
+	TestHistoryChange *change = data;
+	(void) error;
+	if (change->fail)
+		return FALSE;
+	*value += forward ? change->delta : -change->delta;
+	return TRUE;
+}
+
+static HistoryCommand *test_history_command(const gchar *label, gint delta,
+		gboolean fail) {
+	TestHistoryChange *change = g_new0(TestHistoryChange, 1);
+	change->delta = delta;
+	change->fail = fail;
+	return history_command_new(label, apply_test_history_change, change, g_free);
+}
+
+static void test_history_stack(void) {
+	History *history;
+	HistoryCommand *command;
+	TestHistoryChange *change;
+	gint value;
+	GError *error;
+
+	value = 0;
+	history = history_new(&value);
+	error = NULL;
+	CU_ASSERT_TRUE(history_execute(history,
+			test_history_command("Add Point", 1, FALSE), &error));
+	CU_ASSERT_EQUAL(value, 1);
+	CU_ASSERT_STRING_EQUAL(history_undo_label(history), "Add Point");
+	CU_ASSERT_FALSE(history_can_redo(history));
+	CU_ASSERT_TRUE(history_undo(history, &error));
+	CU_ASSERT_EQUAL(value, 0);
+	CU_ASSERT_STRING_EQUAL(history_redo_label(history), "Add Point");
+	CU_ASSERT_TRUE(history_redo(history, &error));
+	CU_ASSERT_EQUAL(value, 1);
+	CU_ASSERT_TRUE(history_undo(history, &error));
+	CU_ASSERT_TRUE(history_execute(history,
+			test_history_command("Add Series", 5, FALSE), &error));
+	CU_ASSERT_EQUAL(value, 5);
+	CU_ASSERT_FALSE(history_can_redo(history));
+	CU_ASSERT_FALSE(history_execute(history,
+			test_history_command("Fail", 9, TRUE), &error));
+	CU_ASSERT_EQUAL(value, 5);
+	CU_ASSERT_STRING_EQUAL(history_undo_label(history), "Add Series");
+	change = g_new0(TestHistoryChange, 1);
+	change->delta = 2;
+	command = history_command_new("Fallible", apply_test_history_change, change,
+			g_free);
+	CU_ASSERT_TRUE(history_execute(history, command, &error));
+	CU_ASSERT_EQUAL(value, 7);
+	change->fail = TRUE;
+	CU_ASSERT_FALSE(history_undo(history, &error));
+	CU_ASSERT_EQUAL(value, 7);
+	CU_ASSERT_STRING_EQUAL(history_undo_label(history), "Fallible");
+	CU_ASSERT_FALSE(history_can_redo(history));
+	change->fail = FALSE;
+	CU_ASSERT_TRUE(history_undo(history, &error));
+	CU_ASSERT_EQUAL(value, 5);
+	history_free(history);
+}
+
+static void test_datastore_transactions(void) {
+	ImageDocument *document, *loaded;
+	DataSeries *series;
+	CalibrationState calibration;
+	gchar *transaction_image;
+	gboolean existing;
+	gint64 image_id;
+	GError *error;
+
+	transaction_image = g_build_filename(test_directory, "transaction.png", NULL);
+	error = NULL;
+	CU_ASSERT_TRUE_FATAL(g_file_set_contents(transaction_image,
+			"transaction image bytes", -1, &error));
+	image_id = resolve_image(transaction_image, 701, 503, &existing);
+	document = image_document_new(image_id);
+	series = image_document_add_series(document, "Transactional", G3_COLOR_RED);
+	error = NULL;
+	CU_ASSERT_TRUE_FATAL(datastore_begin(datastore, &error));
+	CU_ASSERT_TRUE_FATAL(datastore_insert_series(datastore, image_id, series,
+			&error));
+	datastore_rollback(datastore);
+	loaded = image_document_new(image_id);
+	calibration_state_clear(&calibration);
+	CU_ASSERT_TRUE_FATAL(datastore_load_document(datastore, image_id, loaded,
+			&calibration, &error));
+	CU_ASSERT_EQUAL(loaded->series->len, 0);
+	image_document_free(loaded);
+	series->id = 0;
+	CU_ASSERT_TRUE_FATAL(datastore_begin(datastore, &error));
+	CU_ASSERT_TRUE_FATAL(datastore_insert_series(datastore, image_id, series,
+			&error));
+	CU_ASSERT_TRUE_FATAL(datastore_commit(datastore, &error));
+	loaded = image_document_new(image_id);
+	CU_ASSERT_TRUE_FATAL(datastore_load_document(datastore, image_id, loaded,
+			&calibration, &error));
+	CU_ASSERT_EQUAL(loaded->series->len, 1);
+	image_document_free(loaded);
+	image_document_free(document);
+	g_remove(transaction_image);
+	g_free(transaction_image);
+}
 
 static int suite_setup(void) {
 	GError *error;
@@ -120,6 +235,9 @@ static void test_round_trip(void) {
 	error = NULL;
 	image_id = resolve_image(image_path, 640, 480, &existing);
 	calibration_state_clear(&saved);
+	CU_ASSERT_DOUBLE_EQUAL(G3_DEFAULT_POSITIONING_CIRCLE_DIAMETER,
+			saved.positioning_circle_diameter, 1e-12);
+	saved.positioning_circle_diameter = 12.5;
 	saved.log_axis[0] = TRUE;
 	saved.position_set[0] = saved.position_set[1] = TRUE;
 	saved.value_set[0] = saved.value_set[1] = TRUE;
@@ -152,6 +270,7 @@ static void test_round_trip(void) {
 	CU_ASSERT_TRUE(loaded.value_set[1]);
 	CU_ASSERT_DOUBLE_EQUAL(10.25, loaded.axis_x[0], 1e-12);
 	CU_ASSERT_DOUBLE_EQUAL(1000.0, loaded.axis_value[1], 1e-12);
+	CU_ASSERT_DOUBLE_EQUAL(12.5, loaded.positioning_circle_diameter, 1e-12);
 	CU_ASSERT_EQUAL(1, restored->series->len);
 	restored_series = g_ptr_array_index(restored->series, 0);
 	CU_ASSERT_STRING_EQUAL("Upper curve", restored_series->label);
@@ -274,6 +393,63 @@ static void test_rejects_newer_schema(void) {
 	g_free(path);
 }
 
+static void test_migrates_v1_schema(void) {
+	gchar *path, *wal, *shm;
+	sqlite3 *database;
+	sqlite3_stmt *statement;
+	Datastore *migrated;
+	GError *error;
+	gboolean found_column;
+	gint result;
+
+	path = g_build_filename(test_directory, "version-1.sqlite3", NULL);
+	database = NULL;
+	CU_ASSERT_EQUAL(SQLITE_OK, sqlite3_open(path, &database));
+	CU_ASSERT_EQUAL(SQLITE_OK, sqlite3_exec(database,
+			"CREATE TABLE calibrations ("
+			"image_id INTEGER PRIMARY KEY,x_log INTEGER NOT NULL DEFAULT 0,"
+			"y_log INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);"
+			"PRAGMA user_version=1;", NULL, NULL, NULL));
+	sqlite3_close(database);
+	error = NULL;
+	migrated = datastore_open(path, &error);
+	CU_ASSERT_PTR_NOT_NULL_FATAL(migrated);
+	CU_ASSERT_PTR_NULL_FATAL(error);
+	datastore_close(migrated);
+
+	database = NULL;
+	CU_ASSERT_EQUAL(SQLITE_OK, sqlite3_open(path, &database));
+	statement = NULL;
+	CU_ASSERT_EQUAL(SQLITE_OK,
+			sqlite3_prepare_v2(database, "PRAGMA table_info(calibrations);", -1,
+					&statement, NULL));
+	found_column = FALSE;
+	while ((result = sqlite3_step(statement)) == SQLITE_ROW)
+		if (g_strcmp0((const gchar *) sqlite3_column_text(statement, 1),
+				"positioning_circle_diameter") == 0)
+			found_column = TRUE;
+	CU_ASSERT_EQUAL(SQLITE_DONE, result);
+	CU_ASSERT_TRUE(found_column);
+	sqlite3_finalize(statement);
+	statement = NULL;
+	CU_ASSERT_EQUAL(SQLITE_OK,
+			sqlite3_prepare_v2(database, "PRAGMA user_version;", -1, &statement,
+					NULL));
+	CU_ASSERT_EQUAL(SQLITE_ROW, sqlite3_step(statement));
+	CU_ASSERT_EQUAL(2, sqlite3_column_int(statement, 0));
+	sqlite3_finalize(statement);
+	sqlite3_close(database);
+
+	wal = g_strconcat(path, "-wal", NULL);
+	shm = g_strconcat(path, "-shm", NULL);
+	g_remove(path);
+	g_remove(wal);
+	g_remove(shm);
+	g_free(wal);
+	g_free(shm);
+	g_free(path);
+}
+
 static void test_active_series_export_recalculates(void) {
 	struct TabData tab;
 	ImageDocument *document;
@@ -334,6 +510,53 @@ static void test_active_series_export_recalculates(void) {
 	image_document_free(document);
 }
 
+static void test_axis_reader_geometry(void) {
+	struct TabData tab;
+	struct PointValue value;
+	gdouble x_axis[2], y_axis[2];
+
+	memset(&tab, 0, sizeof(tab));
+	/* Skewed axes sharing an origin: P = origin + 0.4 X + 0.3 Y. */
+	tab.axiscoords[0][0] = tab.axiscoords[2][0] = 10.0;
+	tab.axiscoords[0][1] = tab.axiscoords[2][1] = 100.0;
+	tab.axiscoords[1][0] = 110.0;
+	tab.axiscoords[1][1] = 120.0;
+	tab.axiscoords[3][0] = 30.0;
+	tab.axiscoords[3][1] = 0.0;
+	tab.realcoords[0] = tab.realcoords[2] = 0.0;
+	tab.realcoords[1] = 10.0;
+	tab.realcoords[3] = 20.0;
+	CU_ASSERT_TRUE(calculateAxisGuides(56.0, 78.0, &tab, x_axis, y_axis));
+	CU_ASSERT_DOUBLE_EQUAL(50.0, x_axis[0], 1e-12);
+	CU_ASSERT_DOUBLE_EQUAL(108.0, x_axis[1], 1e-12);
+	CU_ASSERT_DOUBLE_EQUAL(16.0, y_axis[0], 1e-12);
+	CU_ASSERT_DOUBLE_EQUAL(70.0, y_axis[1], 1e-12);
+	value = calculatePointValue(56.0, 78.0, &tab);
+	CU_ASSERT_DOUBLE_EQUAL(4.0, value.Xv, 1e-12);
+	CU_ASSERT_DOUBLE_EQUAL(6.0, value.Yv, 1e-12);
+
+	/* The matrix form also handles orientations that made the old component
+	 * divisions singular: vertical X and horizontal Y axes. */
+	tab.axiscoords[0][0] = tab.axiscoords[2][0] = 100.0;
+	tab.axiscoords[0][1] = tab.axiscoords[2][1] = 100.0;
+	tab.axiscoords[1][0] = 100.0;
+	tab.axiscoords[1][1] = 0.0;
+	tab.axiscoords[3][0] = 200.0;
+	tab.axiscoords[3][1] = 100.0;
+	CU_ASSERT_TRUE(calculateAxisGuides(70.0, 60.0, &tab, x_axis, y_axis));
+	CU_ASSERT_DOUBLE_EQUAL(100.0, x_axis[0], 1e-12);
+	CU_ASSERT_DOUBLE_EQUAL(60.0, x_axis[1], 1e-12);
+	CU_ASSERT_DOUBLE_EQUAL(70.0, y_axis[0], 1e-12);
+	CU_ASSERT_DOUBLE_EQUAL(100.0, y_axis[1], 1e-12);
+	value = calculatePointValue(70.0, 60.0, &tab);
+	CU_ASSERT_DOUBLE_EQUAL(4.0, value.Xv, 1e-12);
+	CU_ASSERT_DOUBLE_EQUAL(-6.0, value.Yv, 1e-12);
+
+	tab.axiscoords[3][0] = 100.0;
+	tab.axiscoords[3][1] = 0.0;
+	CU_ASSERT_FALSE(calculateAxisGuides(70.0, 60.0, &tab, x_axis, y_axis));
+}
+
 int main(void) {
 	CU_pSuite suite;
 	unsigned int failures;
@@ -347,8 +570,16 @@ int main(void) {
 			|| CU_add_test(suite, "model helpers", test_model_helpers) == NULL
 			|| CU_add_test(suite, "reject newer schema",
 					test_rejects_newer_schema) == NULL
+			|| CU_add_test(suite, "migrate version 1 schema",
+					test_migrates_v1_schema) == NULL
 			|| CU_add_test(suite, "active series export recalculates",
-					test_active_series_export_recalculates) == NULL) {
+					test_active_series_export_recalculates) == NULL
+			|| CU_add_test(suite, "axis reader geometry",
+					test_axis_reader_geometry) == NULL
+			|| CU_add_test(suite, "in-memory undo/redo stack",
+					test_history_stack) == NULL
+			|| CU_add_test(suite, "datastore transactions",
+					test_datastore_transactions) == NULL) {
 		CU_cleanup_registry();
 		return CU_get_error();
 	}

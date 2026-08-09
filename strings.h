@@ -31,9 +31,9 @@ Authors email : jonas@frantz.fi
 #define COPYRIGHT "Copyright (C) 2011 Jonas Frantz"
 #define COMMENTS "Grab graph data, a program for extracting data from graphs"
 #define LICENSE PROGNAME" is free software; you can redistribute it and/or modify\nit under the terms of the GNU General Public License as published by\nthe Free Software Foundation; either version 2 of the License, or\n(at your option) any later version.\n\ng3data is distributed in the hope that it will be useful,\nbut WITHOUT ANY WARRANTY; without even the implied warranty of\nMERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\nGNU General Public License for more details.\n\nYou should have received a copy of the GNU General Public License\nalong with this program; if not, write to the Free Software\nFoundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA\n"
-#define HOMEPAGEURL "http://www.frantz.fi/software/g3data.php"
-#define HOMEPAGELABEL PROGNAME" homepage"
-#define AUTHORS {"Jonas Frantz", NULL}
+#define HOMEPAGEURL "https://github.com/jdpipe/g3data2"
+#define HOMEPAGELABEL PROGNAME" on GitHub"
+#define AUTHORS {"Jonas Frantz", "Newer features by John Pye", NULL}
 
 /************************************************************************************************/
 /* 					COMMANDLINE HELP 					*/
@@ -100,19 +100,11 @@ gchar xy_label_text[4][32] = {"X<sub>1</sub> value : ",
                               "Y<sub>1</sub> value : ",
                               "Y<sub>2</sub> value : "};
 
-gchar pm_string[] = 	" ± ";
-
-gchar x_string[] = " X : ";
-gchar y_string[] = " Y : ";
-
 gchar filen_string[] = "Filename : ";
-
-gchar nump_string[] = "Number of points : ";
 
 gchar scale_string[] = "Scale image : ";
 
 gchar APheader[] = "<b>Axis points</b>";
-gchar PIheader[] = "<b>Processing information</b>";
 gchar ZAheader[] = "<b>Zoom area</b>";
 gchar Lheader[]  = "<b>Logarithmic scales</b>";
 

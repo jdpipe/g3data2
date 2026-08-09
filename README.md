@@ -29,15 +29,18 @@ scons
 
 It's fairly self-explanatory. But to be explicit:
 
-* you first have to identify the left and right end of your x and y axes in the plot. This sets the transformation from pixel to data coordinates
-* next you click points in the graph, amassing a list of points that can be copied to the clipboard, output to stdout, or written to a `.dat` file chosen through a save dialog. These actions are under the **File** menu for either the current series or all series. Point ordering and inclusion of error columns are persistent export options in the same menu.
+* a new or partially calibrated image starts a guided axis workflow in the left pane. Pick X1, X2, Y1, and Y2 on the image and enter each axis value. You can choose **Sample data instead** and return to calibration later; raw sampled points do not require a completed calibration.
+* next you click points in the graph, amassing a list of points that can be copied to the clipboard, output to stdout, or written to a `.dat` file chosen through a save dialog. The **File** menu exports the current or all series to stdout or a file; the **Edit** menu copies either scope to the clipboard. Point ordering and inclusion of error columns are persistent options grouped beneath the File export actions.
 * sampled points are kept as double-precision image pixel coordinates. Data coordinates are recalculated from the current axis calibration whenever they are displayed or exported.
-* each image can have several named, coloured series. Use the series selector to choose the active series; new points are added to it and export outputs that series.
-* switch to **Select / edit points** to inspect or drag a point. Shift-click markers to add or remove them from a multi-point selection. The **Edit** menu removes the last point, clears the current series, or deletes the selected point(s); Delete and Backspace also delete the selection while the image has focus. Inactive visible series remain on screen in muted colours.
+* once all four axis references and values are set, hold Alt briefly over the image to show the axis reader. It draws skew-aware guides from the cursor to both calibrated axes and shows the current X/Y values in a fixed-size yellow label. **View** → **Show uncertainty** adds the calculated uncertainty to that label. Pressing another key while Alt is held suppresses the reader, so menu shortcuts such as Alt+F behave normally.
+* **View** → **Show positioning circle** adds a translucent black circle with white inner and outer edging at the image cursor. Ctrl+. enlarges the circle and Ctrl+, shrinks it in half-source-pixel diameter steps; the same actions are available in the View menu. Because its size is defined in original-image pixels, it follows image zoom and helps centre points on broad markers or thick lines. Diameter is remembered per image with its calibration, while visibility is remembered as an application preference.
+* each image can have several named, coloured series. The five-row series list shows colour, label, point count, and visibility. Select the active series, use `+` to add one, and double-click or press Enter/F2 to rename. Right-click a series to delete it.
+* a normal image click adds a point. Shift-click toggles a point in the active-series selection; Shift-drag selects several points with a marquee. Drag an already selected marker to move it. The **Edit** menu clears the current series or deletes the selected point(s); Delete and Backspace also delete the selection while the image has focus. Inactive visible series remain on screen in muted colours.
+* content changes are immediately persistent and have a per-tab, memory-only undo/redo history. **Edit** → **Undo** (Ctrl+Z) and **Redo** (Ctrl+Shift+Z) cover point, series, and calibration changes. Closing the tab discards the history but retains its current state in SQLite. Export preferences and zoom/pan are not undoable.
 * images initially use **Zoom to fit**. This remains active across window resizing and maximising until you manually zoom or pan, or choose another zoom level. You can zoom using ctrl-wheel, pan up and down with the mouse wheel, and pan left and right with shift-wheel. Smaller images can be enlarged to 16×; the maximum is reduced automatically for large images to keep the scrollable canvas within a safe size.
 * zooming in is a good idea when selecting points. g3data2 has sub-pixel precision for identifying and working with point data.
 * calibration, series, and sampled positions are saved automatically in `~/.local/share/g3data2/g3data2.sqlite3`. Reopening the same image content restores them, even after the image file is renamed or moved.
-* clipboard exports use tab-separated columns, so they paste directly into spreadsheet cells in applications such as LibreOffice Calc.
+* clipboard exports advertise the `text/tab-separated-values` format explicitly, so they paste directly into spreadsheet cells in applications such as LibreOffice Calc without being mistaken for Markdown. Plain UTF-8 text remains available as a fallback.
 * g3data2 will remember your recent files, which is useful because you never get this stuff right first time.
 * once you have your data file, consider using fityk to do the curve fitting! one you get used to it, it's very powerful!
 
@@ -47,6 +50,7 @@ It's fairly self-explanatory. But to be explicit:
 * Added pixel-value calculations based double-precision arithmetic rather than integers
 * Added persistent calibration and multi-series point storage using SQLite
 * Added graphical point selection, movement, and deletion
+* Added per-image in-memory undo/redo and a guided calibration workflow
 * Implements SCons build script instead of bare Makefile
 
 # Roadmap

@@ -8,7 +8,7 @@
 
 #include "datastore.h"
 
-#define DATASTORE_SCHEMA_VERSION 1
+#define DATASTORE_SCHEMA_VERSION 2
 
 struct Datastore {
 	sqlite3 *db;
@@ -72,6 +72,10 @@ static const gchar *SCHEMA_SQL =
 		" active_series_id INTEGER REFERENCES series(id) ON DELETE SET NULL,"
 		" updated_at TEXT NOT NULL);";
 
+static const gchar *MIGRATION_TO_VERSION_2_SQL =
+		"ALTER TABLE calibrations ADD COLUMN positioning_circle_diameter"
+		" REAL NOT NULL DEFAULT 10.0 CHECK(positioning_circle_diameter > 0);";
+
 static gchar *now_utc(void) {
 	GDateTime *date_time;
 	gchar *result;
@@ -105,6 +109,19 @@ static gboolean exec_sql(Datastore *datastore, const gchar *sql,
 		return FALSE;
 	}
 	return TRUE;
+}
+
+gboolean datastore_begin(Datastore *datastore, GError **error) {
+	return datastore != NULL && exec_sql(datastore, "BEGIN IMMEDIATE;", error);
+}
+
+gboolean datastore_commit(Datastore *datastore, GError **error) {
+	return datastore != NULL && exec_sql(datastore, "COMMIT;", error);
+}
+
+void datastore_rollback(Datastore *datastore) {
+	if (datastore != NULL)
+		exec_sql(datastore, "ROLLBACK;", NULL);
 }
 
 static gboolean prepare(Datastore *datastore, const gchar *sql,
@@ -161,6 +178,11 @@ static gboolean initialize_schema(Datastore *datastore, GError **error) {
 			|| !exec_sql(datastore, "BEGIN IMMEDIATE;", error))
 		return FALSE;
 	if (!exec_sql(datastore, SCHEMA_SQL, error)) {
+		exec_sql(datastore, "ROLLBACK;", NULL);
+		return FALSE;
+	}
+	if (schema_version < 2
+			&& !exec_sql(datastore, MIGRATION_TO_VERSION_2_SQL, error)) {
 		exec_sql(datastore, "ROLLBACK;", NULL);
 		return FALSE;
 	}
@@ -348,10 +370,13 @@ gboolean datastore_resolve_image(Datastore *datastore, const gchar *filename,
 		}
 		sqlite3_finalize(statement);
 	}
-	if (success)
+	if (success) {
 		success = exec_sql(datastore, "COMMIT;", error);
-	else
+		if (!success)
+			exec_sql(datastore, "ROLLBACK;", NULL);
+	} else {
 		exec_sql(datastore, "ROLLBACK;", NULL);
+	}
 	if (success) {
 		if (image_id != NULL)
 			*image_id = found_id;
@@ -419,7 +444,8 @@ gboolean datastore_load_document(Datastore *datastore, gint64 image_id,
 	active_series_id = 0;
 	statement = NULL;
 	success = prepare(datastore,
-			"SELECT x_log,y_log FROM calibrations WHERE image_id=?1;",
+			"SELECT x_log,y_log,positioning_circle_diameter"
+			" FROM calibrations WHERE image_id=?1;",
 			&statement, error);
 	if (success) {
 		sqlite3_bind_int64(statement, 1, image_id);
@@ -427,6 +453,8 @@ gboolean datastore_load_document(Datastore *datastore, gint64 image_id,
 		if (result == SQLITE_ROW) {
 			calibration->log_axis[0] = sqlite3_column_int(statement, 0) != 0;
 			calibration->log_axis[1] = sqlite3_column_int(statement, 1) != 0;
+			calibration->positioning_circle_diameter =
+					sqlite3_column_double(statement, 2);
 		} else if (result != SQLITE_DONE) {
 			set_sql_error(datastore, error, "Loading calibration", result);
 			success = FALSE;
@@ -536,15 +564,20 @@ gboolean datastore_save_calibration(Datastore *datastore, gint64 image_id,
 	statement = NULL;
 	success = exec_sql(datastore, "BEGIN IMMEDIATE;", error)
 			&& prepare(datastore,
-					"INSERT INTO calibrations(image_id,x_log,y_log,updated_at)"
-					" VALUES(?1,?2,?3,?4) ON CONFLICT(image_id) DO UPDATE SET"
+					"INSERT INTO calibrations(image_id,x_log,y_log,"
+					"positioning_circle_diameter,updated_at)"
+					" VALUES(?1,?2,?3,?4,?5) ON CONFLICT(image_id) DO UPDATE SET"
 					" x_log=excluded.x_log,y_log=excluded.y_log,"
+					" positioning_circle_diameter="
+					"excluded.positioning_circle_diameter,"
 					" updated_at=excluded.updated_at;", &statement, error);
 	if (success) {
 		sqlite3_bind_int64(statement, 1, image_id);
 		sqlite3_bind_int(statement, 2, calibration->log_axis[0]);
 		sqlite3_bind_int(statement, 3, calibration->log_axis[1]);
-		sqlite3_bind_text(statement, 4, timestamp, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_double(statement, 4,
+				calibration->positioning_circle_diameter);
+		sqlite3_bind_text(statement, 5, timestamp, -1, SQLITE_TRANSIENT);
 		success = step_done(datastore, statement, "Saving calibration", error);
 	}
 	sqlite3_finalize(statement);

@@ -133,9 +133,9 @@ This representation preserves sub-pixel precision and exact meaning for the
 hashed source image. New and moved points should be constrained to that image's
 pixel bounds.
 
-The four calibration data values and the X/Y logarithmic flags are persisted.
-Calculated X/Y values and calculated errors are not. They remain live results of
-`calculatePointValue()`.
+The four calibration data values, X/Y logarithmic flags, and positioning-circle
+diameter are persisted. Calculated X/Y values and calculated errors are not.
+They remain live results of `calculatePointValue()`.
 
 # Proposed schema {#sec:schema}
 
@@ -169,10 +169,12 @@ CREATE TABLE image_paths (
 CREATE INDEX image_paths_by_path ON image_paths(canonical_path);
 
 CREATE TABLE calibrations (
-    image_id    INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
-    x_log       INTEGER NOT NULL DEFAULT 0 CHECK (x_log IN (0, 1)),
-    y_log       INTEGER NOT NULL DEFAULT 0 CHECK (y_log IN (0, 1)),
-    updated_at  TEXT NOT NULL
+    image_id                    INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+    x_log                       INTEGER NOT NULL DEFAULT 0 CHECK (x_log IN (0, 1)),
+    y_log                       INTEGER NOT NULL DEFAULT 0 CHECK (y_log IN (0, 1)),
+    positioning_circle_diameter REAL NOT NULL DEFAULT 10.0
+                                CHECK (positioning_circle_diameter > 0),
+    updated_at                  TEXT NOT NULL
 );
 
 CREATE TABLE axis_points (
@@ -328,46 +330,49 @@ report the database path so the user can recover or back it up.
 
 # User interface concept {#sec:ui}
 
-The existing left-hand controls are already dense. A collapsible **Series and
-points** section should be added, while the image remains the dominant area.
-An indicative layout is:
+The top controls are removed. Calibration, series, and the optional magnified
+view form one vertically scrollable utility pane to the left of the image. The
+pane has a constrained natural width so it does not consume the canvas when the
+main window is small. An indicative layout is:
 
 ```text
 +-- Controls ----------------------+------------------------------+
-| Axis points                      |                              |
-|   X1 ... X2 ... Y1 ... Y2 ...    |          image canvas        |
+| Calibration                     |                              |
+|   Select X1 on the image (1/4)   |          image canvas        |
+|   [Pick] X1 value [________]     |                              |
+|   [Pick] X2 value [________]     |                              |
+|   [Pick] Y1 value [________]     |                              |
+|   [Pick] Y2 value [________]     |                              |
+|   [ ] Log X  [ ] Log Y          |                              |
+|   [Sample data instead]          |                              |
 |                                  |                              |
-| Series and points                |   coloured points for every  |
+| Data series                  [+] |   coloured points for every  |
+|                                  |   visible series             |
 |   ● Curve A             18  👁   |   visible series             |
 |   ● Curve B              9  👁   |                              |
-|   [ + ] [ Rename ] [ Delete ]    |   selected point has a halo  |
-|   Label  [Curve A___________]    |                              |
-|   Colour [■]                     |                              |
-|                                  |                              |
-|   Mode   (● Add) (○ Select/edit) |                              |
+|   ● Curve C              4  👁   |   selected point has a halo  |
+|   ... five visible rows ...      |                              |
+|   Colour [■]  [x] Visible        |                              |
 |   Selected: Curve A, point 7     |                              |
-|   X 12.34   Y 56.78              |                              |
 +----------------------------------+------------------------------+
 ```
 
 The series list shows a colour swatch, editable label, point count, and
-visibility toggle. Selecting a row makes it the active series. **Add series**
-creates `Series 1`, `Series 2`, and so on with a colour chosen from a
-colour-blind-friendly palette; the label can be changed immediately. A
-`GtkColorButton` permits an arbitrary marker colour.
+visibility toggle. It is a `GtkTreeView` with approximately five rows visible;
+more rows scroll. Selecting a row makes it the active series. The compact `+`
+button creates `Series 1`, `Series 2`, and so on with a colour chosen from a
+colour-blind-friendly palette. Double-click, Enter, or F2 edits the label.
+Right-click exposes Rename and Delete, while Delete is also available from the
+keyboard when the series view has focus. A `GtkColorButton` permits an
+arbitrary marker colour.
 
-The interaction modes should be explicit:
-
-- **Add mode:** a normal click adds a point to the active series. Calibration
-  placement buttons temporarily override this mode as they do now.
-- **Select/edit mode:** clicking near a visible marker selects it; dragging
-  moves it. `Shift`-click adds or removes markers from a multi-point selection.
-  `Delete`, Backspace, or **Edit** → **Delete selected point(s)** removes the
-  selection.
-
-An explicit mode is easier to discover than relying only on the current
-hold-Control-to-move behaviour. Keyboard shortcuts such as `A` for Add, `S` for
-Select/edit, and `Delete` for removal can supplement the controls.
+There is no persistent Add versus Select/edit mode. A normal click adds a point
+to the active series. Shift-click toggles the nearest active-series point in
+the selection, and Shift-drag draws a marquee that selects active-series points
+inside it. Dragging an already selected marker without Shift moves it. Delete,
+Backspace, or **Edit** → **Delete selected point(s)** removes the selection.
+Calibration placement is the one temporary image-click mode and is always
+shown explicitly in the calibration section.
 
 Hit testing must use a screen-space radius, for example 7 pixels, so selecting a
 point feels the same at every zoom level. Search the active series first, then
@@ -381,24 +386,78 @@ zoom level.
 All visible series are drawn in their stored colours. Active-series markers are
 fully opaque; inactive series may be slightly muted. A hovered point gets a
 thin halo, and the selected point gets a larger high-contrast double halo that
-is visible against both light and dark images. The inspector displays its
-series, sample order, current calculated X/Y values, and optionally source-pixel
-coordinates. Those calculated values refresh whenever the calibration changes.
+is visible against both light and dark images.
 
-The existing removal semantics should become less surprising:
+After calibration is complete, holding Alt briefly displays an axis reader at
+the cursor. Black, white-outlined guide lines run parallel to the calibrated
+Y and X directions to meet the X and Y axes respectively, so rotation and skew
+remain visible. A bright yellow, fixed-GUI-font label shows the current X and Y
+values and chooses a visible quadrant around the cursor. **View** → **Show
+uncertainty** adds the calculated errors. Any further key press before the
+delay expires suppresses the reader, leaving Alt menu mnemonics unaffected.
 
-- **Edit** → **Remove last point** removes the highest `sample_order` in the
-  current series;
-- **Edit** → **Clear current series** asks for confirmation; and
-- clearing calibration is a separate action, not the second effect of clicking
-  **Remove all points** twice.
+An optional **View** → **Show positioning circle** overlay follows the image
+cursor. Its translucent black stroke has white edging on both sides, and its
+diameter is stored in source-image pixels so it scales with the image. **Larger
+circle** (Ctrl+.) and **Smaller circle** (Ctrl+,) change that diameter in
+half-pixel steps. The diameter is saved with the image calibration and restored
+when that image is reopened; whether the overlay is shown is an application
+preference instead.
+
+New or partially calibrated images initially arm the first missing reference
+point. Each accepted image click advances to the next missing point. The user
+can dismiss this workflow with **Sample data instead**, retain raw sampled
+points, and return to any reference using its **Pick** or **Update** button.
+This is deliberately non-modal: incomplete calibration disables calculated
+coordinates and export, but does not prevent sampling.
+
+Calibration belongs to the image document, not to a data series. All series in
+the current implementation share X1, X2, Y1, Y2 and the logarithmic-axis flags.
+A later multiple-axis implementation should add named calibration profiles and
+let each series reference one; it should not duplicate calibration fields into
+every series row.
+
+# Undo and redo {#sec:undo}
+
+Each open image tab owns an in-memory command history. The database remains the
+durable current state: executing, undoing, or redoing a content command writes
+through to SQLite immediately. Closing the tab or process discards only the
+history, not the state at its current position.
+
+The history records:
+
+- point addition, selected-point deletion, movement, and whole-series clear;
+- series creation, deletion, rename, colour, and visibility;
+- placement or replacement of X1, X2, Y1, and Y2;
+- calibration value changes, logarithmic X/Y settings, and positioning-circle
+  diameter.
+
+Active-series selection, export preferences, clipboard/export actions, zoom,
+and pan are navigation or output state and are not history commands. Multiple
+selected points are deleted as one command, clearing a series is one command,
+and a point drag is recorded once on release rather than for every motion
+event. Starting a new command after Undo clears the redo branch.
+
+Delete and clear commands detach their model objects and retain them in the
+command while they are undoable. This preserves exact fractional pixel values,
+sample ordering, labels, colours, and point membership. Restoring database rows
+may allocate new SQLite row IDs; the retained model objects are updated with
+those IDs. Commands therefore refer to model objects rather than assuming a
+database ID never changes.
+
+Multi-row commands use a single SQLite transaction. If execute, undo, or redo
+fails, the transaction is rolled back and the command stays on its original
+stack. The **Edit** menu labels the next operations, for example **Undo Add
+Point** and **Redo Clear Series**. The accelerators are Ctrl+Z and
+Ctrl+Shift+Z.
 
 # Export behaviour {#sec:export}
 
 The **File** menu provides separate **Export current series** and **Export all
-series** submenus. Each scope can be written to stdout, saved through a file
-chooser, or copied to the clipboard. Current-series file and stdout output
-retains the existing headerless two- or four-column numeric format.
+series** submenus for stdout and save-through-file-chooser destinations. The
+**Edit** menu provides **Copy current series** and **Copy all series** clipboard
+actions. Current-series file and stdout output retains the existing headerless
+two- or four-column numeric format.
 Point ordering and inclusion of value-error columns are persistent check/radio
 options in the **File** menu and apply to every export destination.
 
@@ -416,7 +475,9 @@ non-empty series:
 Clipboard output uses tabs between every numeric field and newlines between
 records. This makes the plain-text clipboard representation paste directly as
 rows and columns in spreadsheet applications such as LibreOffice Calc. Series
-comment lines occupy a single cell when all-series output is pasted.
+comment lines occupy a single cell when all-series output is pasted. The
+clipboard advertises `text/tab-separated-values` explicitly, with plain UTF-8
+as a fallback, so the `#` label rows are not misclassified as Markdown.
 
 Ordering is applied independently within each series at export time. The
 exporter calculates every point from its stored source-image position and the
@@ -503,7 +564,8 @@ The smallest coherent release is not merely “save the current arrays.” It is
 3. a model containing one or more stable-ID series;
 4. write-through persistence after completed user actions;
 5. a series list with label, colour, visibility, and active selection;
-6. explicit Add and Select/edit modes with selected-point deletion; and
+6. direct click-to-add and Shift-based point selection with selected-point
+   deletion; and
 7. export of the active series, retaining the existing numeric format.
 
 This scope delivers the persistence and multi-series workflow without forcing a

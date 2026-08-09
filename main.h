@@ -24,6 +24,7 @@ Authors email : jonas@frantz.fi
  */
 #include <gtk/gtk.h>					/* Include gtk library */
 #include "model.h"
+#include "history.h"
 
 #define VERSION "1.0.0"					/* Version number */
 
@@ -46,6 +47,14 @@ struct PointValue {
 	double Xv, Yv, Xerr, Yerr;
 };
 
+struct PointValue calculatePointValue(gdouble x, gdouble y,
+		struct TabData *tabData);
+gboolean calculateAxisPosition(gdouble x, gdouble y,
+		const struct TabData *tabData, gdouble *x_fraction,
+		gdouble *y_fraction);
+gboolean calculateAxisGuides(gdouble x, gdouble y,
+		const struct TabData *tabData, gdouble x_axis_intersection[2],
+		gdouble y_axis_intersection[2]);
 GString *formatResultset(struct TabData *tabData, gboolean all_series,
 		gboolean tab_separated);
 
@@ -59,19 +68,16 @@ struct TabData {
 	GtkWidget *xyentry[4];
 	GtkWidget *setxybutton[4];
 	GtkWidget *logcheckbutton[2];
-	GtkWidget *xc_entry, *yc_entry;
-	GtkWidget *nump_entry;
-	GtkWidget *xerr_entry, *yerr_entry; 	// Coordinate and filename entries
 	GtkWidget *logbox;
 	GtkWidget *zoomareabox;
 	GtkWidget *ViewPort;
-	GtkWidget *series_combo;
-	GtkWidget *series_label_entry;
+	GtkWidget *series_view;
+	GtkListStore *series_store;
 	GtkWidget *series_color_button;
 	GtkWidget *series_visible_check;
-	GtkWidget *delete_series_button;
-	GtkWidget *edit_mode_button;
 	GtkWidget *selected_point_label;
+	GtkWidget *calibration_status_label;
+	GtkWidget *calibration_cancel_button;
 
 	cairo_surface_t *image;
 
@@ -81,6 +87,7 @@ struct TabData {
 	gint XSize, YSize;
 	gint sourceXSize, sourceYSize;
 	gdouble imageScale;
+	gdouble positioningCircleDiameter;
 	gdouble realcoords[4]; 					// X,Y coords on graph
 	gboolean UseErrors;
 	gboolean setxypressed[4];
@@ -110,10 +117,17 @@ struct TabData {
 	gdouble pendingZoomScrollCanvasSize[2];
 
 	ImageDocument *document;
+	History *history;
+	CalibrationState committedCalibration;
+	gboolean axisWorkflowDismissed;
 	gboolean loadingStore;
-	gboolean editMode;
 	SamplePoint *movedPoint;
 	DataSeries *movedSeries;
+	gboolean leftPressPending;
+	gdouble leftPressWidget[2];
+	gboolean marqueeActive;
+	gdouble marqueeStart[2];
+	gdouble marqueeEnd[2];
 };
 
 struct ButtonData {

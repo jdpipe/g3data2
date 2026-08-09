@@ -64,6 +64,21 @@ SamplePoint *data_series_add_point(DataSeries *series, gdouble x, gdouble y) {
 	return point;
 }
 
+void data_series_insert_point(DataSeries *series, SamplePoint *point,
+		guint index) {
+	if (series == NULL || point == NULL)
+		return;
+	if (index > series->points->len)
+		index = series->points->len;
+	g_ptr_array_insert(series->points, index, point);
+}
+
+SamplePoint *data_series_steal_point(DataSeries *series, guint index) {
+	if (series == NULL || index >= series->points->len)
+		return NULL;
+	return g_ptr_array_steal_index(series->points, index);
+}
+
 gint data_series_index_of_point(const DataSeries *series,
 		const SamplePoint *point) {
 	guint i;
@@ -115,6 +130,30 @@ DataSeries *image_document_add_series(ImageDocument *document,
 	if (document->active_series == NULL)
 		document->active_series = series;
 	return series;
+}
+
+void image_document_insert_series(ImageDocument *document, DataSeries *series,
+		guint index) {
+	if (document == NULL || series == NULL)
+		return;
+	if (index > document->series->len)
+		index = document->series->len;
+	g_ptr_array_insert(document->series, index, series);
+	if (document->active_series == NULL)
+		document->active_series = series;
+}
+
+DataSeries *image_document_steal_series(ImageDocument *document, guint index) {
+	DataSeries *series;
+
+	if (document == NULL || index >= document->series->len)
+		return NULL;
+	series = g_ptr_array_index(document->series, index);
+	if (document->selected_series == series || document->hovered_series == series)
+		image_document_clear_selection(document);
+	if (document->active_series == series)
+		document->active_series = NULL;
+	return g_ptr_array_steal_index(document->series, index);
 }
 
 gint image_document_index_of_series(const ImageDocument *document,
@@ -249,8 +288,11 @@ gchar *image_document_next_series_label(const ImageDocument *document) {
 }
 
 void calibration_state_clear(CalibrationState *calibration) {
-	if (calibration != NULL)
+	if (calibration != NULL) {
 		memset(calibration, 0, sizeof(*calibration));
+		calibration->positioning_circle_diameter =
+				G3_DEFAULT_POSITIONING_CIRCLE_DIAMETER;
+	}
 }
 
 void rgba_to_components(guint32 rgba, gdouble *red, gdouble *green,

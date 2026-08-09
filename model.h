@@ -5,6 +5,7 @@
 
 #define G3_AXIS_POINT_COUNT 4
 #define G3_COLOR_RED 0xd62728ffu
+#define G3_DEFAULT_POSITIONING_CIRCLE_DIAMETER 10.0
 
 typedef struct SamplePoint {
 	gint64 id;
@@ -29,6 +30,7 @@ typedef struct CalibrationState {
 	gboolean position_set[G3_AXIS_POINT_COUNT];
 	gboolean value_set[G3_AXIS_POINT_COUNT];
 	gboolean log_axis[2];
+	gdouble positioning_circle_diameter;
 } CalibrationState;
 
 typedef struct ImageDocument {
@@ -49,6 +51,9 @@ DataSeries *data_series_new(const gchar *label, guint32 marker_rgba,
 		gint display_order);
 void data_series_free(gpointer data);
 SamplePoint *data_series_add_point(DataSeries *series, gdouble x, gdouble y);
+void data_series_insert_point(DataSeries *series, SamplePoint *point,
+		guint index);
+SamplePoint *data_series_steal_point(DataSeries *series, guint index);
 gboolean data_series_remove_point(DataSeries *series, SamplePoint *point);
 gint data_series_index_of_point(const DataSeries *series,
 		const SamplePoint *point);
@@ -57,6 +62,9 @@ ImageDocument *image_document_new(gint64 image_id);
 void image_document_free(ImageDocument *document);
 DataSeries *image_document_add_series(ImageDocument *document,
 		const gchar *label, guint32 marker_rgba);
+void image_document_insert_series(ImageDocument *document, DataSeries *series,
+		guint index);
+DataSeries *image_document_steal_series(ImageDocument *document, guint index);
 gboolean image_document_remove_series(ImageDocument *document,
 		DataSeries *series);
 void image_document_set_active_series(ImageDocument *document,
