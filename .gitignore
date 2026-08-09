@@ -5,3 +5,6 @@ g3data2
 .cproject
 .project
 Release/*
+config.log
+.scons*
+.sconf*
