@@ -35,6 +35,7 @@
 #include "main.h"									/* Include predefined variables */
 #include "datastore.h"
 #include "history.h"
+#include "image.h"
 #include "strings.h"								/* Include strings */
 #include "vardefs.h"
 
@@ -103,6 +104,16 @@ static void exportErrorsChanged(GtkCheckMenuItem *widget, gpointer data);
 static struct TabData *getCurrentTabData(void);
 static void updateHistoryMenuSensitivity(struct TabData *tabData);
 static void refreshCalibrationWorkflow(struct TabData *tabData);
+static void sourceToImagePixels(const struct TabData *tab, gdouble x, gdouble y, gdouble *u, gdouble *v);
+static void sourceToWidget(const struct TabData *tab, gdouble x, gdouble y, gdouble *u, gdouble *v);
+static void widgetToSource(const struct TabData *tab, gdouble x, gdouble y, gdouble *u, gdouble *v);
+static void refreshPerspectiveControls(struct TabData *tab);
+static void cancelPerspective(GtkWidget *widget, gpointer data);
+static void refreshPerspectiveMenu(struct TabData *tab);
+static GtkWidget *perspective_menu_item, *perspective_enabled_item;
+static gboolean syncingPerspectiveMenu;
+static const gchar *cornerNames[] = {"Top-left", "Top-right", "Bottom-right", "Bottom-left"};
+
 gint setupNewTab(char *filename, gdouble Scale, gdouble maxX,
 		gdouble maxY, gboolean UsePreSetCoords, gdouble *TempCoords,
 		gboolean *Uselogxy, gboolean *UseError);
@@ -111,6 +122,7 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX,
 GtkWidget *window;
 GtkWidget *mainnotebook;
 GtkWidget *close_menu_item;
+GtkWidget *open_external_menu_item;
 GtkWidget *file_menu_widget;
 GtkWidget *start_page_widget;
 GtkWidget *start_icon_view_widget;
@@ -819,7 +831,7 @@ gboolean updateZoomArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 	cairo_t *first_cr;
 	cairo_surface_t *first;
 	struct TabData *tabData;
-	gdouble zoomAreaScale;
+	gdouble zoomAreaScale, image_x, image_y;
 
 	tabData = (struct TabData *) data;
 
@@ -831,14 +843,15 @@ gboolean updateZoomArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 		first = cairo_surface_create_similar(cairo_get_target(cr),
 				CAIRO_CONTENT_COLOR, ZOOMPIXSIZE, ZOOMPIXSIZE);
 
+		sourceToImagePixels(tabData, tabData->mousePointerCoords[0], tabData->mousePointerCoords[1], &image_x, &image_y);
 		first_cr = cairo_create(first);
 		cairo_scale(first_cr, zoomAreaScale, zoomAreaScale);
 		cairo_set_source_surface(
 				first_cr,
 				tabData->image,
-				-tabData->mousePointerCoords[0] * tabData->imageScale
+				-image_x
 						+ ZOOMPIXSIZE / (2 * zoomAreaScale),
-				-tabData->mousePointerCoords[1] * tabData->imageScale
+				-image_y
 						+ ZOOMPIXSIZE / (2 * zoomAreaScale));
 		cairo_paint(first_cr);
 		cairo_scale(first_cr, 1.0 / zoomAreaScale, 1.0 / zoomAreaScale);
@@ -1216,16 +1229,44 @@ static void viewportSizeAllocateEvent(GtkWidget *widget, GtkAllocation *allocati
 	maybeApplyPendingRecenter((struct TabData *) data);
 }
 
-static void getImageCoords(struct TabData *tabData, gdouble widgetX,
-		gdouble widgetY, gdouble *imageX, gdouble *imageY) {
-	if (tabData->viewZoom <= 0)
-		tabData->viewZoom = 1.0;
-	if (tabData->imageScale <= 0)
-		tabData->imageScale = 1.0;
-	*imageX = (widgetX - tabData->viewOrigin[0])
-			/ (tabData->viewZoom * tabData->imageScale);
-	*imageY = (widgetY - tabData->viewOrigin[1])
-			/ (tabData->viewZoom * tabData->imageScale);
+static gboolean perspectiveDisplayActive(const struct TabData *tab) {
+    return tab->perspective.valid && tab->perspective.enabled && !tab->perspectiveEditing;
+}
+
+static void sourceToImagePixels(const struct TabData *tab, gdouble x, gdouble y,
+        gdouble *u, gdouble *v) {
+    if (perspectiveDisplayActive(tab)) {
+        if (!perspective_map(tab->perspectiveTransform.forward, x, y, u, v))
+            *u = *v = NAN;
+    } else {
+        *u = x * tab->imageScale;
+        *v = y * tab->imageScale;
+    }
+}
+
+static void sourceToWidget(const struct TabData *tab, gdouble x, gdouble y,
+        gdouble *u, gdouble *v) {
+    sourceToImagePixels(tab, x, y, u, v);
+    *u = *u * tab->viewZoom + tab->viewOrigin[0];
+    *v = *v * tab->viewZoom + tab->viewOrigin[1];
+}
+
+static void widgetToSource(const struct TabData *tab, gdouble x, gdouble y,
+        gdouble *u, gdouble *v) {
+    x = (x-tab->viewOrigin[0])/tab->viewZoom;
+    y = (y-tab->viewOrigin[1])/tab->viewZoom;
+    if (perspectiveDisplayActive(tab)) {
+        if (!perspective_map(tab->perspectiveTransform.inverse,x,y,u,v))
+            *u = *v = NAN;
+    } else {
+        *u = x/tab->imageScale;
+        *v = y/tab->imageScale;
+    }
+}
+
+static void getImageCoords(struct TabData *tab, gdouble x, gdouble y,
+        gdouble *u, gdouble *v) {
+    widgetToSource(tab,x,y,u,v);
 }
 
 static GtkWidget *g3TableNew(guint rows, guint columns, gboolean homogeneous) {
@@ -1334,7 +1375,7 @@ static void visibleDrawingBounds(GtkWidget *widget, struct TabData *tabData,
 static gboolean calibratedAxisCrossesCard(const struct TabData *tabData,
 		gint first, gint second, gdouble x, gdouble y, gdouble width,
 		gdouble height) {
-	gdouble scale, x1, y1, dx, dy, signed_distance;
+	gdouble x1, y1, dx, dy, signed_distance;
 	gdouble min_distance, max_distance;
 	gdouble corners[4][2] = {
 		{ x, y }, { x + width, y },
@@ -1342,13 +1383,9 @@ static gboolean calibratedAxisCrossesCard(const struct TabData *tabData,
 	};
 	gint i;
 
-	scale = tabData->imageScale * tabData->viewZoom;
-	x1 = tabData->axiscoords[first][0] * scale + tabData->viewOrigin[0];
-	y1 = tabData->axiscoords[first][1] * scale + tabData->viewOrigin[1];
-	dx = (tabData->axiscoords[second][0]
-			- tabData->axiscoords[first][0]) * scale;
-	dy = (tabData->axiscoords[second][1]
-			- tabData->axiscoords[first][1]) * scale;
+    sourceToWidget(tabData,tabData->axiscoords[first][0],tabData->axiscoords[first][1],&x1,&y1);
+    sourceToWidget(tabData,tabData->axiscoords[second][0],tabData->axiscoords[second][1],&dx,&dy);
+    dx -= x1; dy -= y1;
 	min_distance = G_MAXDOUBLE;
 	max_distance = -G_MAXDOUBLE;
 	for (i = 0; i < 4; i++) {
@@ -1362,7 +1399,7 @@ static gboolean calibratedAxisCrossesCard(const struct TabData *tabData,
 
 static gint axisReaderCandidatePenalty(const struct TabData *tabData,
 		gdouble x, gdouble y, gdouble width, gdouble height) {
-	gdouble scale, source_x, source_y, x_fraction, y_fraction;
+	gdouble source_x, source_y, x_fraction, y_fraction;
 	gdouble min_x_fraction, min_y_fraction;
 	gdouble corners[4][2] = {
 		{ x, y }, { x + width, y },
@@ -1379,12 +1416,10 @@ static gint axisReaderCandidatePenalty(const struct TabData *tabData,
 	if (calibratedAxisCrossesCard(tabData, 2, 3, x, y, width, height))
 		penalty += 100;
 
-	scale = tabData->imageScale * tabData->viewZoom;
 	min_x_fraction = G_MAXDOUBLE;
 	min_y_fraction = G_MAXDOUBLE;
 	for (i = 0; i < 4; i++) {
-		source_x = (corners[i][0] - tabData->viewOrigin[0]) / scale;
-		source_y = (corners[i][1] - tabData->viewOrigin[1]) / scale;
+		widgetToSource(tabData,corners[i][0],corners[i][1],&source_x,&source_y);
 		if (!calculateAxisPosition(source_x, source_y, tabData, &x_fraction,
 				&y_fraction))
 			return G_MAXINT / 2;
@@ -1452,33 +1487,22 @@ static gint axisReaderDecimalPlaces(gdouble uncertainty) {
 }
 
 static void drawPositioningCircle(cairo_t *cr, struct TabData *tabData) {
-	gdouble scale, center_x, center_y, radius;
-
-	if (!showPositioningCircle
-			|| !pointIsInsideImage(tabData, tabData->mousePointerCoords[0],
-					tabData->mousePointerCoords[1]))
-		return;
-	scale = tabData->imageScale * tabData->viewZoom;
-	center_x = tabData->mousePointerCoords[0] * scale + tabData->viewOrigin[0];
-	center_y = tabData->mousePointerCoords[1] * scale + tabData->viewOrigin[1];
-	radius = tabData->positioningCircleDiameter * scale / 2.0;
-
-	cairo_save(cr);
-	cairo_rectangle(cr, tabData->viewOrigin[0], tabData->viewOrigin[1],
-			tabData->XSize * tabData->viewZoom,
-			tabData->YSize * tabData->viewZoom);
-	cairo_clip(cr);
-	/* A broad white stroke underneath the black stroke leaves a white edge on
-	 * both its inner and outer sides. Stroke widths stay in screen pixels. */
-	cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.7);
-	cairo_set_line_width(cr, 6.0);
-	cairo_arc(cr, center_x, center_y, radius, 0.0, 2.0 * G_PI);
-	cairo_stroke(cr);
-	cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.7);
-	cairo_set_line_width(cr, 2.0);
-	cairo_arc(cr, center_x, center_y, radius, 0.0, 2.0 * G_PI);
-	cairo_stroke(cr);
-	cairo_restore(cr);
+    gdouble x, y, pixel_scale, radius;
+    if (!showPositioningCircle || !pointIsInsideImage(tabData,
+            tabData->mousePointerCoords[0],tabData->mousePointerCoords[1])) return;
+    sourceToWidget(tabData,tabData->mousePointerCoords[0],
+        tabData->mousePointerCoords[1],&x,&y);
+    pixel_scale = perspectiveDisplayActive(tabData)
+        ? tabData->perspectiveTransform.center_pixel_scale : tabData->imageScale;
+    radius = tabData->positioningCircleDiameter * pixel_scale * tabData->viewZoom / 2;
+    if (!isfinite(x) || !isfinite(y) || !isfinite(radius) || radius <= 0) return;
+    cairo_save(cr);
+    /* Project only the centre. The guide is a circle in the corrected view,
+     * with a constant radius as the cursor moves around the image. */
+    cairo_arc(cr,x,y,radius,0,2*G_PI);
+    cairo_set_source_rgba(cr,1,1,1,0.7); cairo_set_line_width(cr,6); cairo_stroke_preserve(cr);
+    cairo_set_source_rgba(cr,0,0,0,0.7); cairo_set_line_width(cr,2); cairo_stroke(cr);
+    cairo_restore(cr);
 }
 
 static void drawAxisReader(GtkWidget *widget, cairo_t *cr,
@@ -1486,14 +1510,14 @@ static void drawAxisReader(GtkWidget *widget, cairo_t *cr,
 	struct PointValue value;
 	gdouble x_axis_source[2], y_axis_source[2];
 	gdouble cursor_x, cursor_y, x_axis[2], y_axis[2];
-	gdouble scale, left, top, right, bottom, label_x, label_y;
+	gdouble left, top, right, bottom, label_x, label_y;
 	gdouble text_width, text_height, card_width, card_height;
 	const gdouble padding = 5.0;
 	gchar *text;
 	PangoLayout *layout;
 	gint layout_width, layout_height, x_decimals, y_decimals;
 
-	if (!axisReaderVisible || !calibrationIsComplete(tabData)
+	if (tabData->perspectiveEditing || !axisReaderVisible || !calibrationIsComplete(tabData)
 			|| !pointIsInsideImage(tabData, tabData->mousePointerCoords[0],
 					tabData->mousePointerCoords[1])
 			|| !calculateAxisGuides(tabData->mousePointerCoords[0],
@@ -1505,13 +1529,9 @@ static void drawAxisReader(GtkWidget *widget, cairo_t *cr,
 	if (!isfinite(value.Xv) || !isfinite(value.Yv))
 		return;
 
-	scale = tabData->imageScale * tabData->viewZoom;
-	cursor_x = tabData->mousePointerCoords[0] * scale + tabData->viewOrigin[0];
-	cursor_y = tabData->mousePointerCoords[1] * scale + tabData->viewOrigin[1];
-	x_axis[0] = x_axis_source[0] * scale + tabData->viewOrigin[0];
-	x_axis[1] = x_axis_source[1] * scale + tabData->viewOrigin[1];
-	y_axis[0] = y_axis_source[0] * scale + tabData->viewOrigin[0];
-	y_axis[1] = y_axis_source[1] * scale + tabData->viewOrigin[1];
+    sourceToWidget(tabData,tabData->mousePointerCoords[0],tabData->mousePointerCoords[1],&cursor_x,&cursor_y);
+    sourceToWidget(tabData,x_axis_source[0],x_axis_source[1],&x_axis[0],&x_axis[1]);
+    sourceToWidget(tabData,y_axis_source[0],y_axis_source[1],&y_axis[0],&y_axis[1]);
 
 	cairo_save(cr);
 	cairo_rectangle(cr, tabData->viewOrigin[0], tabData->viewOrigin[1],
@@ -1584,11 +1604,42 @@ gboolean updateImageArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 	cairo_paint(cr);
 	cairo_restore(cr);
 
+    if (tabData->perspectiveEditing) {
+        gboolean started = FALSE;
+        cairo_set_source_rgb(cr,0.0,0.6,0.9); cairo_set_line_width(cr,2);
+        for (i=0;i<4;i++) if (tabData->perspectivePicked[i]) {
+            gdouble x,y;
+            sourceToWidget(tabData,tabData->perspectiveDraft.corners[i][0],tabData->perspectiveDraft.corners[i][1],&x,&y);
+            if (!started) cairo_move_to(cr,x,y); else cairo_line_to(cr,x,y);
+            started = TRUE;
+        }
+        if (tabData->perspectiveDraft.valid) cairo_close_path(cr);
+        cairo_stroke(cr);
+        for (i=0;i<4;i++) if (tabData->perspectivePicked[i]) {
+            gdouble x,y,label_x,label_y;
+            gint label_width,label_height;
+            gchar *text = g_strdup_printf("%d %s",i+1,cornerNames[i]);
+            PangoLayout *layout = gtk_widget_create_pango_layout(widget,text);
+            pango_layout_get_pixel_size(layout,&label_width,&label_height);
+            sourceToWidget(tabData,tabData->perspectiveDraft.corners[i][0],tabData->perspectiveDraft.corners[i][1],&x,&y);
+            cairo_arc(cr,x,y,6,0,2*G_PI); cairo_set_source_rgb(cr,1,1,1); cairo_fill_preserve(cr);
+            cairo_set_source_rgb(cr,0,0.4,0.7); cairo_stroke(cr);
+            label_x = (i == 1 || i == 2) ? x-10-label_width : x+10;
+            label_y = i >= 2 ? y-6-label_height : y+6;
+            cairo_move_to(cr,label_x,label_y); pango_cairo_layout_path(cr,layout);
+            cairo_set_source_rgb(cr,1,1,1); cairo_set_line_width(cr,3); cairo_stroke_preserve(cr);
+            cairo_set_source_rgb(cr,0,0.25,0.5); cairo_fill(cr); cairo_set_line_width(cr,2);
+            g_object_unref(layout); g_free(text);
+        }
+        drawPositioningCircle(cr,tabData);
+        return TRUE;
+    }
+
 	for (i = 0; i < 4; i++) {
 		if (tabData->bpressed[i]) {
-			drawMarker(cr, (gint) (tabData->axiscoords[i][0] * tabData->imageScale
-					* tabData->viewZoom + tabData->viewOrigin[0]), (gint) (tabData->axiscoords[i][1]
-					* tabData->imageScale * tabData->viewZoom + tabData->viewOrigin[1]), i / 2);
+            gdouble x,y;
+            sourceToWidget(tabData,tabData->axiscoords[i][0],tabData->axiscoords[i][1],&x,&y);
+            if (isfinite(x) && isfinite(y)) drawMarker(cr,(gint)x,(gint)y,i/2);
 		}
 	}
 
@@ -1603,11 +1654,10 @@ gboolean updateImageArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 		for (point_index = 0; point_index < series->points->len; point_index++) {
 			SamplePoint *point;
 			point = g_ptr_array_index(series->points, point_index);
-			drawSeriesMarker(cr,
-					point->source_x_px * tabData->imageScale * tabData->viewZoom
-							+ tabData->viewOrigin[0],
-					point->source_y_px * tabData->imageScale * tabData->viewZoom
-							+ tabData->viewOrigin[1],
+            gdouble x,y;
+            sourceToWidget(tabData,point->source_x_px,point->source_y_px,&x,&y);
+            if (!isfinite(x) || !isfinite(y)) continue;
+            drawSeriesMarker(cr,x,y,
 					series->marker_rgba,
 					series == tabData->document->active_series,
 					point == tabData->document->hovered_point,
@@ -1638,6 +1688,7 @@ gboolean updateImageArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 static void setButtonSensitivity(struct TabData *tabData) {
 	updateExportMenuSensitivity(tabData);
 	updateEditMenuSensitivity(tabData);
+	refreshPerspectiveMenu(tabData);
 }
 
 static void reportDatastoreError(const gchar *operation, GError *error) {
@@ -2012,6 +2063,217 @@ static gboolean executeHistoryCommand(struct TabData *tabData,
 	}
 	refreshAfterHistoryChange(tabData);
 	return TRUE;
+}
+
+
+typedef struct {
+    PerspectiveState old_state, new_state;
+} PerspectiveChange;
+
+static void refreshPerspectiveMenu(struct TabData *tab) {
+    syncingPerspectiveMenu = TRUE;
+    if (perspective_menu_item)
+        gtk_widget_set_sensitive(perspective_menu_item, tab != NULL && !tab->perspectiveEditing);
+    if (perspective_enabled_item) {
+        gtk_widget_set_sensitive(perspective_enabled_item,
+            tab != NULL && tab->perspective.valid && !tab->perspectiveEditing);
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(perspective_enabled_item),
+            tab != NULL && tab->perspective.enabled);
+    }
+    syncingPerspectiveMenu = FALSE;
+}
+
+static void showPerspectiveImage(struct TabData *tab) {
+    cairo_surface_t *display = perspectiveDisplayActive(tab) ? tab->correctedImage : tab->originalImage;
+    if (!display) return;
+    cairo_surface_destroy(tab->image);
+    tab->image = cairo_surface_reference(display);
+    tab->XSize = cairo_image_surface_get_width(display);
+    tab->YSize = cairo_image_surface_get_height(display);
+    tab->mousePointerCoords[0] = tab->mousePointerCoords[1] = -1;
+    tab->leftPressPending = tab->marqueeActive = FALSE;
+    tab->movedPoint = NULL;
+    gtk_widget_set_visible(tab->normalControls, !tab->perspectiveEditing);
+    gtk_widget_set_visible(tab->perspectivePanel, tab->perspectiveEditing);
+    tab->zoomedToFit = TRUE;
+    tab->fittedViewportWidth = tab->fittedViewportHeight = -1;
+    applyStickyZoomToFit(tab, TRUE);
+    gtk_widget_queue_draw(tab->drawing_area);
+    gtk_widget_queue_draw(tab->zoom_area);
+    refreshPerspectiveMenu(tab);
+    updateEditMenuSensitivity(tab);
+}
+
+/* Build and persist before replacing the live state. An allocation/database
+ * failure leaves both the current image and all sampled positions untouched. */
+static gboolean setPerspectiveState(struct TabData *tab, const PerspectiveState *state,
+        gboolean persist, GError **error) {
+    PerspectiveTransform transform = {0};
+    cairo_surface_t *rendered = NULL;
+    gboolean same_corners = state->valid && tab->perspective.valid
+        && memcmp(state->corners,tab->perspective.corners,sizeof(state->corners)) == 0;
+    if (state->valid && !perspective_build(state,tab->sourceXSize,tab->sourceYSize,&transform,error))
+        return FALSE;
+    if (state->valid && state->enabled && (!same_corners || !tab->correctedImage)) {
+        rendered = perspective_render(tab->originalImage,tab->imageScale,&transform,error);
+        if (!rendered) return FALSE;
+    }
+    if (persist && tabHasPersistentImage(tab)
+            && !datastore_save_perspective(appDatastore,tab->document->image_id,state,error)) {
+        if (rendered) cairo_surface_destroy(rendered);
+        return FALSE;
+    }
+    if (!same_corners || rendered) {
+        if (tab->correctedImage) cairo_surface_destroy(tab->correctedImage);
+        tab->correctedImage = rendered;
+    }
+    tab->perspective = *state;
+    tab->perspectiveTransform = transform;
+    tab->perspectiveEditing = FALSE;
+    showPerspectiveImage(tab);
+    return TRUE;
+}
+
+static gboolean applyPerspectiveChange(gpointer context, gpointer data,
+        gboolean forward, GError **error) {
+    PerspectiveChange *change = data;
+    return setPerspectiveState(context, forward ? &change->new_state : &change->old_state, TRUE,error);
+}
+
+static void refreshPerspectiveControls(struct TabData *tab) {
+    gint i;
+    gboolean complete = TRUE, valid = FALSE;
+    GError *error = NULL;
+    PerspectiveTransform transform;
+    gchar *message;
+    for (i=0;i<4;i++) {
+        gchar *label = g_strdup_printf("%d. %s%s%s",i+1,cornerNames[i],
+            tab->perspectivePicked[i] ? " ✓" : "",tab->perspectivePick == i ? " ←" : "");
+        gtk_button_set_label(GTK_BUTTON(tab->perspectiveButtons[i]),label);
+        g_free(label);
+        complete = complete && tab->perspectivePicked[i];
+    }
+    tab->perspectiveDraft.valid = complete;
+    if (complete)
+        valid = perspective_build(&tab->perspectiveDraft,tab->sourceXSize,tab->sourceYSize,&transform,&error);
+    gtk_widget_set_sensitive(tab->perspectiveApply,valid);
+    if (error) message = g_strdup(error->message);
+    else if (tab->perspectivePick >= 0)
+        message = g_strdup_printf("Click the %s corner on the original image.",cornerNames[tab->perspectivePick]);
+    else message = g_strdup("Ready to apply. Select a corner button to replace its position.");
+    gtk_label_set_text(GTK_LABEL(tab->perspectiveStatus),message);
+    g_free(message); g_clear_error(&error);
+    gtk_widget_queue_draw(tab->drawing_area);
+}
+
+static void pickPerspectiveCorner(GtkWidget *widget, gpointer data) {
+    struct TabData *tab = data;
+    tab->perspectivePick = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(widget),"corner-index"));
+    refreshPerspectiveControls(tab);
+    gtk_widget_grab_focus(tab->drawing_area);
+}
+
+static void resetPerspectiveCorners(GtkWidget *widget, gpointer data) {
+    struct TabData *tab = data;
+    (void) widget;
+    memset(&tab->perspectiveDraft,0,sizeof(tab->perspectiveDraft));
+    memset(tab->perspectivePicked,0,sizeof(tab->perspectivePicked));
+    tab->perspectivePick = 0;
+    refreshPerspectiveControls(tab);
+}
+
+static void cancelPerspective(GtkWidget *widget, gpointer data) {
+    struct TabData *tab = data;
+    (void) widget;
+    tab->perspectiveEditing = FALSE;
+    showPerspectiveImage(tab);
+    refreshCalibrationWorkflow(tab);
+}
+
+static void applyPerspective(GtkWidget *widget, gpointer data) {
+    struct TabData *tab = data;
+    PerspectiveChange *change = g_new0(PerspectiveChange,1);
+    GError *error = NULL;
+    (void) widget;
+    change->old_state = tab->perspective;
+    change->new_state = tab->perspectiveDraft;
+    change->new_state.enabled = TRUE;
+    if (!history_execute(tab->history,history_command_new("Perspective Correction",
+            applyPerspectiveChange,change,g_free),&error)) {
+        gtk_label_set_text(GTK_LABEL(tab->perspectiveStatus),error ? error->message : "Could not apply correction.");
+        g_clear_error(&error);
+        return;
+    }
+    refreshAfterHistoryChange(tab);
+}
+
+static void editPerspective(GtkWidget *widget, gpointer data) {
+    struct TabData *tab = getCurrentTabData();
+    gint i;
+    (void) widget; (void) data;
+    if (!tab || tab->perspectiveEditing) return;
+    tab->perspectiveEditing = TRUE;
+    tab->perspectiveDraft = tab->perspective;
+    for (i=0;i<4;i++) tab->perspectivePicked[i] = tab->perspective.valid;
+    tab->perspectivePick = tab->perspective.valid ? -1 : 0;
+    showPerspectiveImage(tab);
+    refreshPerspectiveControls(tab);
+}
+
+static void togglePerspective(GtkCheckMenuItem *widget, gpointer data) {
+    struct TabData *tab = getCurrentTabData();
+    PerspectiveChange *change;
+    (void) data;
+    if (syncingPerspectiveMenu || !tab || tab->perspectiveEditing || !tab->perspective.valid) return;
+    if (tab->perspective.enabled == gtk_check_menu_item_get_active(widget)) return;
+    change = g_new0(PerspectiveChange,1);
+    change->old_state = change->new_state = tab->perspective;
+    change->new_state.enabled = gtk_check_menu_item_get_active(widget);
+    executeHistoryCommand(tab,history_command_new(change->new_state.enabled
+        ? "Enable Perspective Correction" : "Disable Perspective Correction",
+        applyPerspectiveChange,change,g_free),"switching perspective correction");
+    refreshPerspectiveMenu(tab);
+}
+
+static GtkWidget *createPerspectivePanel(struct TabData *tab) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL,ELEM_SEP);
+    GtkWidget *label = gtk_label_new(NULL), *button, *buttons;
+    gint i;
+    gtk_label_set_markup(GTK_LABEL(label),"<b>Perspective correction</b>");
+    gtk_widget_set_halign(label,GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(box),label,FALSE,FALSE,0);
+    label = gtk_label_new("Pick the corners of a plot border or grid rectangle in clockwise order. The corner names describe the desired upright view.");
+    gtk_label_set_line_wrap(GTK_LABEL(label),TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(label),28);
+    gtk_label_set_xalign(GTK_LABEL(label),0);
+    gtk_box_pack_start(GTK_BOX(box),label,FALSE,FALSE,0);
+    for (i=0;i<4;i++) {
+        button = gtk_button_new_with_label(cornerNames[i]);
+        tab->perspectiveButtons[i] = button;
+        g_object_set_data(G_OBJECT(button),"corner-index",GINT_TO_POINTER(i));
+        g_signal_connect(button,"clicked",G_CALLBACK(pickPerspectiveCorner),tab);
+        gtk_box_pack_start(GTK_BOX(box),button,FALSE,FALSE,0);
+    }
+    tab->perspectiveStatus = gtk_label_new("");
+    gtk_label_set_line_wrap(GTK_LABEL(tab->perspectiveStatus),TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(tab->perspectiveStatus),28);
+    gtk_label_set_xalign(GTK_LABEL(tab->perspectiveStatus),0);
+    gtk_box_pack_start(GTK_BOX(box),tab->perspectiveStatus,FALSE,FALSE,0);
+    button = gtk_button_new_with_label("Start over");
+    g_signal_connect(button,"clicked",G_CALLBACK(resetPerspectiveCorners),tab);
+    gtk_box_pack_start(GTK_BOX(box),button,FALSE,FALSE,0);
+    buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL,ELEM_SEP);
+    button = gtk_button_new_with_label("Cancel");
+    g_signal_connect(button,"clicked",G_CALLBACK(cancelPerspective),tab);
+    gtk_box_pack_start(GTK_BOX(buttons),button,TRUE,TRUE,0);
+    tab->perspectiveApply = gtk_button_new_with_label("Apply");
+    g_signal_connect(tab->perspectiveApply,"clicked",G_CALLBACK(applyPerspective),tab);
+    gtk_box_pack_start(GTK_BOX(buttons),tab->perspectiveApply,TRUE,TRUE,0);
+    gtk_box_pack_start(GTK_BOX(box),buttons,FALSE,FALSE,0);
+    gtk_widget_show_all(box);
+    gtk_widget_set_no_show_all(box,TRUE);
+    gtk_widget_hide(box);
+    return box;
 }
 
 static void refreshAxisReader(struct TabData *tabData) {
@@ -2536,12 +2798,11 @@ static SamplePoint *findPointAt(struct TabData *tabData, gdouble imageX,
 				continue;
 			for (point_index = 0; point_index < series->points->len; point_index++) {
 				SamplePoint *point;
-				gdouble dx, dy, distance;
+				gdouble dx, dy, distance, px, py, cx, cy;
 				point = g_ptr_array_index(series->points, point_index);
-				dx = (point->source_x_px - imageX) * tabData->imageScale
-						* tabData->viewZoom;
-				dy = (point->source_y_px - imageY) * tabData->imageScale
-						* tabData->viewZoom;
+                sourceToWidget(tabData,point->source_x_px,point->source_y_px,&px,&py);
+                sourceToWidget(tabData,imageX,imageY,&cx,&cy);
+                dx=px-cx; dy=py-cy;
 				distance = sqrt(dx * dx + dy * dy);
 				if (distance <= threshold && distance < best_distance) {
 					best_distance = distance;
@@ -2600,6 +2861,21 @@ gint mouseButtonPressEvent(GtkWidget *widget, GdkEventButton *event,
 	gtk_widget_grab_focus(tabData->drawing_area);
 
 	getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
+    if (tabData->perspectiveEditing && event->button == 1) {
+        if (tabData->perspectivePick >= 0 && pointIsInsideImage(tabData,imageX,imageY)) {
+            gint corner = tabData->perspectivePick;
+            tabData->perspectiveDraft.corners[corner][0] = CLAMP(imageX,0,tabData->sourceXSize-1);
+            tabData->perspectiveDraft.corners[corner][1] = CLAMP(imageY,0,tabData->sourceYSize-1);
+            tabData->perspectivePicked[corner] = TRUE;
+            tabData->perspectivePick = -1;
+            for (i=0;i<4;i++) if (!tabData->perspectivePicked[i]) {
+                tabData->perspectivePick = i; break;
+            }
+            refreshPerspectiveControls(tabData);
+        }
+        return TRUE;
+    }
+
 	settingAxis = tabData->setxypressed[0] || tabData->setxypressed[1]
 			|| tabData->setxypressed[2] || tabData->setxypressed[3];
 	shiftSelecting = (event->state & GDK_SHIFT_MASK) != 0 && !settingAxis;
@@ -2609,8 +2885,7 @@ gint mouseButtonPressEvent(GtkWidget *widget, GdkEventButton *event,
 			CalibrationChange *change;
 			gchar *label;
 
-			if (imageX < 0 || imageY < 0 || imageX >= tabData->sourceXSize
-					|| imageY >= tabData->sourceYSize)
+			if (!pointIsInsideImage(tabData,imageX,imageY))
 				return TRUE;
 			for (i = 0; i < G3_AXIS_POINT_COUNT; i++)
 				if (tabData->setxypressed[i])
@@ -2667,8 +2942,7 @@ gint mouseButtonPressEvent(GtkWidget *widget, GdkEventButton *event,
 			} else {
 				PointSetChange *change;
 				PointRecord record;
-				if (imageX < 0 || imageY < 0 || imageX >= tabData->sourceXSize
-						|| imageY >= tabData->sourceYSize)
+				if (!pointIsInsideImage(tabData,imageX,imageY))
 					return TRUE;
 				series = activeSeries(tabData);
 				if (series == NULL)
@@ -2730,6 +3004,9 @@ gint mouseButtonReleaseEvent(GtkWidget *widget, GdkEventButton *event,
 	if (event->button == 1) {
 		if (tabData->movedPoint != NULL) {
 			PointMoveChange *change;
+            if (!isfinite(imageX) || !isfinite(imageY)) {
+                imageX=tabData->mousePointerCoords[0]; imageY=tabData->mousePointerCoords[1];
+            }
 			gdouble new_x, new_y;
 			new_x = CLAMP(
 					tabData->movedOrigCoords[0]
@@ -2759,17 +3036,14 @@ gint mouseButtonReleaseEvent(GtkWidget *widget, GdkEventButton *event,
 			if (tabData->marqueeActive && series != NULL) {
 				gdouble x1, y1, x2, y2;
 				guint i;
-				getImageCoords(tabData, tabData->marqueeStart[0],
-						tabData->marqueeStart[1], &x1, &y1);
-				getImageCoords(tabData, tabData->marqueeEnd[0],
-						tabData->marqueeEnd[1], &x2, &y2);
+				x1=tabData->marqueeStart[0]; y1=tabData->marqueeStart[1];
+				x2=tabData->marqueeEnd[0]; y2=tabData->marqueeEnd[1];
 				image_document_clear_selection(tabData->document);
 				for (i = 0; i < series->points->len; i++) {
 					SamplePoint *point = g_ptr_array_index(series->points, i);
-					if (point->source_x_px >= MIN(x1, x2)
-							&& point->source_x_px <= MAX(x1, x2)
-							&& point->source_y_px >= MIN(y1, y2)
-							&& point->source_y_px <= MAX(y1, y2))
+					gdouble px,py;
+					sourceToWidget(tabData,point->source_x_px,point->source_y_px,&px,&py);
+					if (px >= MIN(x1,x2) && px <= MAX(x1,x2) && py >= MIN(y1,y2) && py <= MAX(y1,y2))
 						image_document_select_point(tabData->document, series, point,
 								TRUE);
 				}
@@ -2962,12 +3236,9 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 			getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
 			imageX = CLAMP(imageX, 0.0, tabData->sourceXSize - 1.0);
 			imageY = CLAMP(imageY, 0.0, tabData->sourceYSize - 1.0);
-			focusX = imageX * tabData->imageScale * tabData->viewZoom
-					+ tabData->viewOrigin[0]
-					- gtk_adjustment_get_value(hadj);
-			focusY = imageY * tabData->imageScale * tabData->viewZoom
-					+ tabData->viewOrigin[1]
-					- gtk_adjustment_get_value(vadj);
+            sourceToWidget(tabData,imageX,imageY,&focusX,&focusY);
+            focusX -= gtk_adjustment_get_value(hadj);
+            focusY -= gtk_adjustment_get_value(vadj);
 		}
 
 		setMainImageZoom(tabData, newZoom, focusX, focusY);
@@ -3349,6 +3620,9 @@ gint keyPressEvent(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 						DATA_STORE_NAME);
 		if (tabData == NULL)
 			return 0;
+		if (event->keyval == GDK_KEY_Escape && tabData->perspectiveEditing) {
+            cancelPerspective(NULL,tabData); return TRUE;
+        }
 		if (event->keyval == GDK_KEY_Left) {
 			disableZoomToFit(tabData);
 			adjustment = gtk_scrollable_get_hadjustment(
@@ -3411,6 +3685,7 @@ gint keyPressEvent(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 					-1, -1);
 		} else if ((event->keyval == GDK_KEY_Delete
 				|| event->keyval == GDK_KEY_BackSpace)
+				&& !tabData->perspectiveEditing
 				&& gtk_window_get_focus(GTK_WINDOW(window)) == tabData->drawing_area) {
 			deleteSelectedPoint(NULL, tabData);
 		}
@@ -3453,15 +3728,19 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 	GdkCursor *cursor;
 	GdkDisplay *display;
 	GtkWidget *dialog;
+	GError *error = NULL;
 
-	tabData->image = cairo_image_surface_create_from_png(filename);
-	if (cairo_surface_status(tabData->image) != CAIRO_STATUS_SUCCESS) {
+	tabData->image = load_image_surface(filename, &error);
+	if (tabData->image == NULL) {
 		dialog = gtk_message_dialog_new(GTK_WINDOW(window), /* Notify user of the error */
 		GTK_DIALOG_DESTROY_WITH_PARENT, /* with a dialog */
 		GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "Error loading file '%s'",
 				filename);
+		gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),
+				"%s", error != NULL ? error->message : "Unknown image loading error");
 		gtk_dialog_run(GTK_DIALOG (dialog));
 		gtk_widget_destroy(dialog);
+		g_clear_error(&error);
 
 		return -1; /* exit */
 	}
@@ -3489,7 +3768,7 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 	if (Scale == -1 && mScale != -1)
 		Scale = mScale;
 
-	if (Scale != -1) {
+	if (Scale != -1 && Scale != 1.0) {
 		cairo_surface_t *source_image;
 		cairo_surface_t *scaled_image;
 		cairo_t *scaled_cr;
@@ -3501,7 +3780,7 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 		source_image = tabData->image;
 		cairo_surface_flush(source_image);
 		scaled_image = cairo_surface_create_similar(source_image,
-				CAIRO_CONTENT_COLOR, tabData->XSize, tabData->YSize);
+				cairo_surface_get_content(source_image), tabData->XSize, tabData->YSize);
 		scaled_cr = cairo_create(scaled_image);
 		cairo_scale(scaled_cr, Scale, Scale);
 		cairo_set_source_surface(scaled_cr, source_image, 0, 0);
@@ -3511,6 +3790,7 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 		tabData->image = scaled_image;
 	}
 
+	tabData->originalImage = cairo_surface_reference(tabData->image);
 	tabData->drawing_area = gtk_drawing_area_new(); /* Create new drawing area */
 	gtk_widget_set_can_focus(tabData->drawing_area, TRUE);
 	tabData->viewOrigin[0] = MAIN_IMAGE_CANVAS_MIN_PAD;
@@ -3621,6 +3901,13 @@ static void restoreStoredDocument(struct TabData *tabData,
 		}
 	}
 	applyCalibrationToTab(tabData, &calibration);
+    if (appDatastore != NULL && image_id > 0) {
+        PerspectiveState state;
+        error = NULL;
+        if (!datastore_load_perspective(appDatastore,image_id,&state,&error)
+                || !setPerspectiveState(tabData,&state,FALSE,&error))
+            reportDatastoreError("restoring perspective correction",error);
+    }
 	refreshSeriesWidgets(tabData);
 	syncActivePointCount(tabData);
 	if (!calibrationIsComplete(tabData)) {
@@ -3682,6 +3969,9 @@ static void freeTabData(gpointer data) {
 		return;
 	if (tabData->image != NULL)
 		cairo_surface_destroy(tabData->image);
+	if (tabData->originalImage) cairo_surface_destroy(tabData->originalImage);
+	if (tabData->correctedImage) cairo_surface_destroy(tabData->correctedImage);
+	g_free(tabData->imagePath);
 	history_free(tabData->history);
 	image_document_free(tabData->document);
 	g_free(tabData);
@@ -3727,6 +4017,7 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 		return -1;
 	}
 	NumberOfTabs++;
+	tabData->imagePath = g_canonicalize_filename(filename, NULL);
 
 	strncpy(buf2, filename, 256);
 	if (strcmp(dirname(buf2), getcwd(buf, 256)) == 0) {
@@ -3744,6 +4035,7 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	TabNum = gtk_notebook_append_page((GtkNotebook *) mainnotebook, table,
 			tab_label);
 	if (TabNum == -1) {
+		g_free(tabData->imagePath);
 		g_free(tabData);
 		return -1;
 	}
@@ -3934,10 +4226,14 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	gtk_box_pack_start(GTK_BOX(bottomhbox), controls_scroll, FALSE, TRUE,
 			ELEM_SEP);
 	gtk_container_add(GTK_CONTAINER(controls_scroll), blvbox);
-	gtk_box_pack_start(GTK_BOX(blvbox), tlvbox, FALSE, FALSE, 0);
+	tabData->perspectivePanel = createPerspectivePanel(tabData);
+    gtk_box_pack_start(GTK_BOX(blvbox),tabData->perspectivePanel,FALSE,FALSE,0);
+    tabData->normalControls = gtk_box_new(GTK_ORIENTATION_VERTICAL,GROUP_SEP);
+    gtk_box_pack_start(GTK_BOX(blvbox),tabData->normalControls,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(tabData->normalControls), tlvbox, FALSE, FALSE, 0);
 
 	subvbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, ELEM_SEP);
-	gtk_box_pack_start(GTK_BOX(blvbox), subvbox, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(tabData->normalControls), subvbox, FALSE, FALSE, 0);
 	Slabel = gtk_label_new(NULL);
 	gtk_label_set_markup(GTK_LABEL(Slabel), "<b>Data series</b>");
 	gtk_widget_set_halign(Slabel, GTK_ALIGN_START);
@@ -4038,6 +4334,8 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	gtk_box_pack_start(GTK_BOX (subvbox), fixed, FALSE, FALSE, 0);
 
 	tabData->logbox = tlvbox;
+	gtk_widget_show_all(tabData->normalControls);
+	gtk_widget_set_no_show_all(tabData->normalControls,TRUE);
 
 	if (FileInCwd) {
 		strncpy(tabData->FileNames, basename(filename), 256);
@@ -4258,6 +4556,45 @@ GCallback menuFileOpen(void) {
 	return NULL;
 }
 
+static void menuOpenImageExternally(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData;
+	gchar *uri;
+	GError *error;
+	gboolean opened;
+
+	(void) widget;
+	(void) data;
+	tabData = getCurrentTabData();
+	if (tabData == NULL || tabData->imagePath == NULL)
+		return;
+
+	error = NULL;
+	uri = g_filename_to_uri(tabData->imagePath, NULL, &error);
+	opened = FALSE;
+	if (uri != NULL) {
+#if GTK_CHECK_VERSION(3, 22, 0)
+		opened = gtk_show_uri_on_window(GTK_WINDOW(window), uri,
+				GDK_CURRENT_TIME, &error);
+#else
+		opened = gtk_show_uri(gtk_widget_get_screen(window), uri,
+				GDK_CURRENT_TIME, &error);
+#endif
+	}
+	if (!opened) {
+		GtkWidget *dialog;
+		dialog = gtk_message_dialog_new(GTK_WINDOW(window),
+				GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_ERROR,
+				GTK_BUTTONS_CLOSE,
+				"Could not open the image in the system image viewer");
+		gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),
+				"%s", error != NULL ? error->message : "Unknown error");
+		gtk_dialog_run(GTK_DIALOG(dialog));
+		gtk_widget_destroy(dialog);
+	}
+	g_clear_error(&error);
+	g_free(uri);
+}
+
 /****************************************************************/
 /* This function destroys a dialog.				*/
 /****************************************************************/
@@ -4401,9 +4738,9 @@ static void updateEditMenuSensitivity(struct TabData *tabData) {
 	gboolean has_points;
 	guint selection_count;
 
-	series = tabData != NULL ? activeSeries(tabData) : NULL;
+	series = tabData != NULL && !tabData->perspectiveEditing ? activeSeries(tabData) : NULL;
 	has_points = series != NULL && series->points->len > 0;
-	selection_count = tabData != NULL && tabData->document != NULL
+	selection_count = tabData != NULL && !tabData->perspectiveEditing && tabData->document != NULL
 			? image_document_selection_count(tabData->document) : 0;
 	if (clear_series_menu_item != NULL)
 		gtk_widget_set_sensitive(clear_series_menu_item, has_points);
@@ -4420,7 +4757,7 @@ static void updateHistoryMenuSensitivity(struct TabData *tabData) {
 	const gchar *label;
 	gchar *caption;
 
-	label = tabData != NULL ? history_undo_label(tabData->history) : NULL;
+	label = tabData != NULL && !tabData->perspectiveEditing ? history_undo_label(tabData->history) : NULL;
 	caption = label != NULL ? g_strdup_printf("_Undo %s", label)
 			: g_strdup("_Undo");
 	if (undo_menu_item != NULL) {
@@ -4428,7 +4765,7 @@ static void updateHistoryMenuSensitivity(struct TabData *tabData) {
 		gtk_widget_set_sensitive(undo_menu_item, label != NULL);
 	}
 	g_free(caption);
-	label = tabData != NULL ? history_redo_label(tabData->history) : NULL;
+	label = tabData != NULL && !tabData->perspectiveEditing ? history_redo_label(tabData->history) : NULL;
 	caption = label != NULL ? g_strdup_printf("_Redo %s", label)
 			: g_strdup("_Redo");
 	if (redo_menu_item != NULL) {
@@ -4444,8 +4781,12 @@ static void refreshActionMenuSensitivity(GtkWidget *widget, gpointer data) {
 	(void) widget;
 	(void) data;
 	tabData = getCurrentTabData();
+	if (open_external_menu_item != NULL)
+		gtk_widget_set_sensitive(open_external_menu_item,
+				tabData != NULL && tabData->imagePath != NULL);
 	updateExportMenuSensitivity(tabData);
 	updateEditMenuSensitivity(tabData);
+	refreshPerspectiveMenu(tabData);
 }
 
 static void undoFromMenu(GtkWidget *widget, gpointer data) {
@@ -4455,7 +4796,7 @@ static void undoFromMenu(GtkWidget *widget, gpointer data) {
 	(void) widget;
 	(void) data;
 	tabData = getCurrentTabData();
-	if (tabData == NULL)
+	if (tabData == NULL || tabData->perspectiveEditing)
 		return;
 	error = NULL;
 	if (!history_undo(tabData->history, &error)) {
@@ -4473,7 +4814,7 @@ static void redoFromMenu(GtkWidget *widget, gpointer data) {
 	(void) widget;
 	(void) data;
 	tabData = getCurrentTabData();
-	if (tabData == NULL)
+	if (tabData == NULL || tabData->perspectiveEditing)
 		return;
 	error = NULL;
 	if (!history_redo(tabData->history, &error)) {
@@ -4926,14 +5267,18 @@ int main(int argc, char **argv) {
 			G_CALLBACK(refreshActionMenuSensitivity), NULL);
 
 	open_item = gtk_menu_item_new_with_mnemonic("_Open…");
+	open_external_menu_item = gtk_menu_item_new_with_mnemonic(
+			"Open in System Image _Viewer");
 	export_current_menu_item = gtk_menu_item_new_with_mnemonic(
 			"Export _current series");
 	export_all_menu_item = gtk_menu_item_new_with_mnemonic("Export _all series");
 	close_menu_item = gtk_menu_item_new_with_mnemonic("_Close");
 	quit_item = gtk_menu_item_new_with_mnemonic("_Quit");
 	gtk_widget_set_sensitive(close_menu_item, FALSE);
+	gtk_widget_set_sensitive(open_external_menu_item, FALSE);
 
 	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), open_item);
+	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), open_external_menu_item);
 	separator_item = gtk_separator_menu_item_new();
 	gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), separator_item);
 
@@ -5023,6 +5368,16 @@ int main(int argc, char **argv) {
 	gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), copy_current_menu_item);
 	gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), copy_all_menu_item);
 
+    perspective_menu_item = gtk_menu_item_new_with_label("Perspective correction…");
+    perspective_enabled_item = gtk_check_menu_item_new_with_label("Use perspective correction");
+    gtk_widget_set_sensitive(perspective_menu_item,FALSE);
+    gtk_widget_set_sensitive(perspective_enabled_item,FALSE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),perspective_menu_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),perspective_enabled_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(view_menu),gtk_separator_menu_item_new());
+    g_signal_connect(perspective_menu_item,"activate",G_CALLBACK(editPerspective),NULL);
+    g_signal_connect(perspective_enabled_item,"toggled",G_CALLBACK(togglePerspective),NULL);
+    g_signal_connect(view_menu,"show",G_CALLBACK(refreshActionMenuSensitivity),NULL);
 	zoom_area_item = gtk_check_menu_item_new_with_label("Zoom area");
 	axis_settings_item = gtk_check_menu_item_new_with_label("Axis settings");
 	show_uncertainty_item = gtk_check_menu_item_new_with_label(
@@ -5067,6 +5422,8 @@ int main(int argc, char **argv) {
 
 	g_signal_connect(G_OBJECT(open_item), "activate", G_CALLBACK(menuFileOpen),
 			NULL);
+	g_signal_connect(G_OBJECT(open_external_menu_item), "activate",
+			G_CALLBACK(menuOpenImageExternally), NULL);
 	g_signal_connect(G_OBJECT(close_menu_item), "activate",
 			G_CALLBACK(menuTabClose), NULL);
 	g_signal_connect(G_OBJECT(quit_item), "activate", G_CALLBACK(menuFileExit),

@@ -89,7 +89,7 @@ if env["DEBUG"]:
     env.Append(CPPDEFINES=["G3DATA2_DEBUG"])
     print("Build mode: DEBUG (G3DATA2_DEBUG enabled)")
 
-sources = ["main.c", "sort.c", "points.c", "drawing.c", "model.c", "datastore.c", "history.c"]
+sources = ["main.c", "sort.c", "points.c", "drawing.c", "model.c", "datastore.c", "history.c", "image.c", "perspective.c"]
 application = env.Program(target="g3data2", source=sources)
 Default(application)
 
@@ -100,6 +100,10 @@ if have_cunit:
         test_env.Append(RPATH=test_env["LIBPATH"])
     test_sources = [
         test_env.Object(target="tests/test_datastore.o", source="tests/test_datastore.c"),
+        test_env.Object(target="tests/test_image.o", source="tests/test_image.c"),
+        test_env.Object(target="tests/image.o", source="image.c"),
+        test_env.Object(target="tests/perspective.o", source="perspective.c"),
+        test_env.Object(target="tests/test_perspective.o", source="tests/test_perspective.c"),
         test_env.Object(target="tests/model.o", source="model.c"),
         test_env.Object(target="tests/datastore.o", source="datastore.c"),
         test_env.Object(target="tests/points.o", source="points.c"),

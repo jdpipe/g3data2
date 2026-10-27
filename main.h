@@ -25,6 +25,7 @@ Authors email : jonas@frantz.fi
 #include <gtk/gtk.h>					/* Include gtk library */
 #include "model.h"
 #include "history.h"
+#include "perspective.h"
 
 #define VERSION "1.0.0"					/* Version number */
 
@@ -63,6 +64,13 @@ typedef enum {
 } UI_DROP_TARGET_INFO;
 
 struct TabData {
+	PerspectiveState perspective, perspectiveDraft;
+	PerspectiveTransform perspectiveTransform;
+	gboolean perspectiveEditing, perspectivePicked[4];
+	gint perspectivePick;
+	GtkWidget *normalControls, *perspectivePanel, *perspectiveStatus;
+	GtkWidget *perspectiveApply, *perspectiveButtons[4];
+	cairo_surface_t *originalImage, *correctedImage;
 	GtkWidget *drawing_area;
 	GtkWidget *zoom_area; 					// Drawing areas
 	GtkWidget *xyentry[4];
@@ -95,6 +103,7 @@ struct TabData {
 	gboolean valueset[4];
 	gboolean logxy[2]; // = { FALSE, FALSE };
 	gchar FileNames[256];
+	gchar *imagePath;
 
 	gdouble mousePointerCoords[2];
 	gdouble viewZoom;

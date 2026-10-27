@@ -8,7 +8,7 @@
 
 #include "datastore.h"
 
-#define DATASTORE_SCHEMA_VERSION 2
+#define DATASTORE_SCHEMA_VERSION 3
 
 struct Datastore {
 	sqlite3 *db;
@@ -18,6 +18,11 @@ struct Datastore {
 G_DEFINE_QUARK(g3data2-datastore-error-quark, datastore_error)
 
 static const gchar *SCHEMA_SQL =
+		"CREATE TABLE IF NOT EXISTS perspective ("
+		" image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,"
+		" valid INTEGER NOT NULL, enabled INTEGER NOT NULL,"
+		" x0 REAL NOT NULL,y0 REAL NOT NULL,x1 REAL NOT NULL,y1 REAL NOT NULL,"
+		" x2 REAL NOT NULL,y2 REAL NOT NULL,x3 REAL NOT NULL,y3 REAL NOT NULL);"
 		"CREATE TABLE IF NOT EXISTS images ("
 		" id INTEGER PRIMARY KEY,"
 		" hash_algorithm TEXT NOT NULL DEFAULT 'sha256',"
@@ -550,6 +555,51 @@ gboolean datastore_load_document(Datastore *datastore, gint64 image_id,
 		image_document_clear_selection(document);
 	}
 	return success;
+}
+
+gboolean datastore_load_perspective(Datastore *datastore, gint64 image_id,
+        PerspectiveState *state, GError **error) {
+    sqlite3_stmt *statement = NULL;
+    gint result, i;
+    memset(state, 0, sizeof(*state));
+    if (!prepare(datastore, "SELECT valid,enabled,x0,y0,x1,y1,x2,y2,x3,y3"
+            " FROM perspective WHERE image_id=?1;", &statement, error))
+        return FALSE;
+    sqlite3_bind_int64(statement, 1, image_id);
+    result = sqlite3_step(statement);
+    if (result == SQLITE_ROW) {
+        state->valid = sqlite3_column_int(statement, 0);
+        state->enabled = sqlite3_column_int(statement, 1);
+        for (i = 0; i < 4; i++) {
+            state->corners[i][0] = sqlite3_column_double(statement, 2+2*i);
+            state->corners[i][1] = sqlite3_column_double(statement, 3+2*i);
+        }
+    } else if (result != SQLITE_DONE)
+        set_sql_error(datastore, error, "Loading perspective correction", result);
+    sqlite3_finalize(statement);
+    return result == SQLITE_ROW || result == SQLITE_DONE;
+}
+
+gboolean datastore_save_perspective(Datastore *datastore, gint64 image_id,
+        const PerspectiveState *state, GError **error) {
+    sqlite3_stmt *statement = NULL;
+    gboolean success;
+    gint i;
+    if (!prepare(datastore, "INSERT INTO perspective VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"
+            " ON CONFLICT(image_id) DO UPDATE SET valid=excluded.valid,enabled=excluded.enabled,"
+            " x0=excluded.x0,y0=excluded.y0,x1=excluded.x1,y1=excluded.y1,"
+            " x2=excluded.x2,y2=excluded.y2,x3=excluded.x3,y3=excluded.y3;",
+            &statement, error)) return FALSE;
+    sqlite3_bind_int64(statement, 1, image_id);
+    sqlite3_bind_int(statement, 2, state->valid);
+    sqlite3_bind_int(statement, 3, state->enabled);
+    for (i = 0; i < 4; i++) {
+        sqlite3_bind_double(statement, 4+2*i, state->corners[i][0]);
+        sqlite3_bind_double(statement, 5+2*i, state->corners[i][1]);
+    }
+    success = step_done(datastore, statement, "Saving perspective correction", error);
+    sqlite3_finalize(statement);
+    return success;
 }
 
 gboolean datastore_save_calibration(Datastore *datastore, gint64 image_id,

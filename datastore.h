@@ -4,6 +4,7 @@
 #include <glib.h>
 
 #include "model.h"
+#include "perspective.h"
 
 typedef struct Datastore Datastore;
 
@@ -36,6 +37,10 @@ gboolean datastore_load_document(Datastore *datastore, gint64 image_id,
 
 gboolean datastore_save_calibration(Datastore *datastore, gint64 image_id,
 		const CalibrationState *calibration, GError **error);
+gboolean datastore_load_perspective(Datastore *datastore, gint64 image_id,
+		PerspectiveState *state, GError **error);
+gboolean datastore_save_perspective(Datastore *datastore, gint64 image_id,
+		const PerspectiveState *state, GError **error);
 
 gboolean datastore_insert_series(Datastore *datastore, gint64 image_id,
 		DataSeries *series, GError **error);

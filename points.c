@@ -52,21 +52,29 @@ gboolean calculateAxisPosition(gdouble x, gdouble y,
 		gdouble *y_fraction) {
 	gdouble ux, uy, vx, vy, determinant, axis_scale;
 	gdouble px, py;
+	gdouble axes[4][2];
+	gint i;
+	memcpy(axes, tabData->axiscoords, sizeof(axes));
+	if (tabData->perspective.valid && tabData->perspective.enabled) {
+		if (!perspective_map(tabData->perspectiveTransform.forward, x, y, &x, &y)) return FALSE;
+		for (i = 0; i < 4; i++)
+			if (!perspective_map(tabData->perspectiveTransform.forward, axes[i][0], axes[i][1], &axes[i][0], &axes[i][1])) return FALSE;
+	}
 
-	ux = tabData->axiscoords[1][0] - tabData->axiscoords[0][0];
-	uy = tabData->axiscoords[1][1] - tabData->axiscoords[0][1];
-	vx = tabData->axiscoords[3][0] - tabData->axiscoords[2][0];
-	vy = tabData->axiscoords[3][1] - tabData->axiscoords[2][1];
+	ux = axes[1][0] - axes[0][0];
+	uy = axes[1][1] - axes[0][1];
+	vx = axes[3][0] - axes[2][0];
+	vy = axes[3][1] - axes[2][1];
 	determinant = ux * vy - uy * vx;
 	axis_scale = hypot(ux, uy) * hypot(vx, vy);
 	if (axis_scale == 0.0 || fabs(determinant) <= 1e-12 * axis_scale)
 		return FALSE;
 
-	px = x - tabData->axiscoords[0][0];
-	py = y - tabData->axiscoords[0][1];
+	px = x - axes[0][0];
+	py = y - axes[0][1];
 	*x_fraction = (px * vy - py * vx) / determinant;
-	px = x - tabData->axiscoords[2][0];
-	py = y - tabData->axiscoords[2][1];
+	px = x - axes[2][0];
+	py = y - axes[2][1];
 	*y_fraction = (ux * py - uy * px) / determinant;
 	return TRUE;
 }
@@ -76,17 +84,31 @@ gboolean calculateAxisGuides(gdouble x, gdouble y,
 		gdouble y_axis_intersection[2]) {
 	gdouble x_fraction, y_fraction;
 	gdouble ux, uy, vx, vy;
+	gdouble axes[4][2];
+	gint i;
+	memcpy(axes, tabData->axiscoords, sizeof(axes));
+	if (tabData->perspective.valid && tabData->perspective.enabled)
+		for (i = 0; i < 4; i++)
+			if (!perspective_map(tabData->perspectiveTransform.forward, axes[i][0], axes[i][1], &axes[i][0], &axes[i][1])) return FALSE;
 
 	if (!calculateAxisPosition(x, y, tabData, &x_fraction, &y_fraction))
 		return FALSE;
-	ux = tabData->axiscoords[1][0] - tabData->axiscoords[0][0];
-	uy = tabData->axiscoords[1][1] - tabData->axiscoords[0][1];
-	vx = tabData->axiscoords[3][0] - tabData->axiscoords[2][0];
-	vy = tabData->axiscoords[3][1] - tabData->axiscoords[2][1];
-	x_axis_intersection[0] = tabData->axiscoords[0][0] + x_fraction * ux;
-	x_axis_intersection[1] = tabData->axiscoords[0][1] + x_fraction * uy;
-	y_axis_intersection[0] = tabData->axiscoords[2][0] + y_fraction * vx;
-	y_axis_intersection[1] = tabData->axiscoords[2][1] + y_fraction * vy;
+	ux = axes[1][0] - axes[0][0];
+	uy = axes[1][1] - axes[0][1];
+	vx = axes[3][0] - axes[2][0];
+	vy = axes[3][1] - axes[2][1];
+	x_axis_intersection[0] = axes[0][0] + x_fraction * ux;
+	x_axis_intersection[1] = axes[0][1] + x_fraction * uy;
+	y_axis_intersection[0] = axes[2][0] + y_fraction * vx;
+	y_axis_intersection[1] = axes[2][1] + y_fraction * vy;
+	if (tabData->perspective.valid && tabData->perspective.enabled) {
+        if (!perspective_map(tabData->perspectiveTransform.inverse,
+                x_axis_intersection[0], x_axis_intersection[1],
+                &x_axis_intersection[0], &x_axis_intersection[1])
+                || !perspective_map(tabData->perspectiveTransform.inverse,
+                y_axis_intersection[0], y_axis_intersection[1],
+                &y_axis_intersection[0], &y_axis_intersection[1])) return FALSE;
+    }
 	return TRUE;
 }
 

@@ -10,11 +10,11 @@ mandir ?= /usr/share/man
 .c.o:
 	$(CC) -c $(CFLAGS) $(CPPFLAGS) $<
 
-all: main.o sort.o points.o drawing.o model.o datastore.o g3data2.1.gz
-	$(CC) $(CFLAGS) -o g3data2 main.o sort.o points.o drawing.o model.o datastore.o $(LIBS)
+all: main.o sort.o points.o drawing.o model.o datastore.o history.o image.o perspective.o g3data2.1.gz
+	$(CC) $(CFLAGS) -o g3data2 main.o sort.o points.o drawing.o model.o datastore.o history.o image.o perspective.o $(LIBS)
 	strip g3data2
 
-main.o: main.c main.h strings.h vardefs.h
+main.o: main.c main.h strings.h vardefs.h image.h
 
 sort.o: sort.c main.h
 
@@ -26,8 +26,14 @@ model.o: model.c model.h
 
 datastore.o: datastore.c datastore.h model.h
 
-test_datastore: tests/test_datastore.c model.c model.h datastore.c datastore.h points.c sort.c main.h
-	$(CC) $(CFLAGS) $(CUNIT_CFLAGS) -o $@ tests/test_datastore.c model.c datastore.c points.c sort.c $(LIBS) $(CUNIT_LIBS) -Wl,-rpath,$(CUNIT_LIBDIR)
+history.o: history.c history.h
+
+perspective.o: perspective.c perspective.h
+
+image.o: image.c image.h
+
+test_datastore: tests/test_datastore.c tests/test_image.c tests/test_perspective.c model.c model.h datastore.c datastore.h points.c sort.c main.h history.c history.h image.c image.h perspective.c perspective.h
+	$(CC) $(CFLAGS) $(CUNIT_CFLAGS) -o $@ tests/test_datastore.c tests/test_image.c tests/test_perspective.c model.c datastore.c points.c sort.c history.c image.c perspective.c $(LIBS) $(CUNIT_LIBS) -Wl,-rpath,$(CUNIT_LIBDIR)
 
 test: test_datastore
 	./test_datastore

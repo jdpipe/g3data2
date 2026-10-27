@@ -137,6 +137,31 @@ The four calibration data values, X/Y logarithmic flags, and positioning-circle
 diameter are persisted. Calculated X/Y values and calculated errors are not.
 They remain live results of `calculatePointValue()`.
 
+Schema version 3 adds a `perspective` row per image, containing four corner
+positions in original-image pixels and valid/enabled flags. The corners are
+ordered top-left, top-right, bottom-right, bottom-left in the intended upright
+view. Only Apply commits a draft; Cancel leaves the previous state intact.
+Applying, toggling, undoing, or redoing correction persists that row without
+rewriting calibration or sampled point coordinates.
+
+An enabled correction maps source positions and calibration references through
+a homography before calculating axis fractions (and then logarithmic values,
+where applicable). Drawing and hit testing map source positions into the
+corrected view; clicks map back through the inverse. The corrected bitmap is a
+disposable cache, never the image identity or the source of stored coordinates.
+Its bounds include the whole transformed source image with transparent padding,
+and its dimensions are limited to control memory use. Reopening reconstructs
+the mapping and cache from the original image and saved corners. Editing corners
+temporarily displays the original image without changing the committed mapping.
+
+The positioning guide remains circular in the corrected view. Its persisted
+diameter and half-pixel adjustment steps use a fixed scale sampled at the
+selected rectangle's centre: the square root of the absolute determinant of
+the source-to-corrected mapping's Jacobian. This uses an area-equivalent pixel
+size without preferring either axis, and keeps the guide's size constant as
+the cursor moves. Zoom multiplies that radius normally; correction off or
+corner editing uses the original-image pixel scale.
+
 # Proposed schema {#sec:schema}
 
 The following schema is deliberately small. Timestamps are UTC ISO 8601 strings
@@ -337,13 +362,13 @@ main window is small. An indicative layout is:
 
 ```text
 +-- Controls ----------------------+------------------------------+
-| Calibration                     |                              |
+| Calibration                      |                              |
 |   Select X1 on the image (1/4)   |          image canvas        |
 |   [Pick] X1 value [________]     |                              |
 |   [Pick] X2 value [________]     |                              |
 |   [Pick] Y1 value [________]     |                              |
 |   [Pick] Y2 value [________]     |                              |
-|   [ ] Log X  [ ] Log Y          |                              |
+|   [ ] Log X  [ ] Log Y           |                              |
 |   [Sample data instead]          |                              |
 |                                  |                              |
 | Data series                  [+] |   coloured points for every  |

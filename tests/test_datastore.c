@@ -10,6 +10,11 @@
 #include "../main.h"
 
 static gchar *test_directory;
+void test_image_loading(void);
+void test_perspective_geometry(void);
+void test_perspective_render(void);
+void test_perspective_storage(void);
+void test_perspective_pixel_scale(void);
 static gchar *database_path;
 static gchar *image_path;
 static Datastore *datastore;
@@ -436,7 +441,7 @@ static void test_migrates_v1_schema(void) {
 			sqlite3_prepare_v2(database, "PRAGMA user_version;", -1, &statement,
 					NULL));
 	CU_ASSERT_EQUAL(SQLITE_ROW, sqlite3_step(statement));
-	CU_ASSERT_EQUAL(2, sqlite3_column_int(statement, 0));
+	CU_ASSERT_EQUAL(3, sqlite3_column_int(statement, 0));
 	sqlite3_finalize(statement);
 	sqlite3_close(database);
 
@@ -565,6 +570,11 @@ int main(void) {
 		return CU_get_error();
 	suite = CU_add_suite("datastore", suite_setup, suite_teardown);
 	if (suite == NULL
+			|| CU_add_test(suite, "image format loading", test_image_loading) == NULL
+            || CU_add_test(suite, "perspective geometry", test_perspective_geometry) == NULL
+            || CU_add_test(suite, "perspective centre pixel scale", test_perspective_pixel_scale) == NULL
+            || CU_add_test(suite, "perspective rendering", test_perspective_render) == NULL
+            || CU_add_test(suite, "perspective persistence", test_perspective_storage) == NULL
 			|| CU_add_test(suite, "image identity", test_image_identity) == NULL
 			|| CU_add_test(suite, "persistence round trip", test_round_trip) == NULL
 			|| CU_add_test(suite, "model helpers", test_model_helpers) == NULL
