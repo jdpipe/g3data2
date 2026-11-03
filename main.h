@@ -113,10 +113,15 @@ struct TabData {
 	gdouble movedOrigCoords[2];
 	gdouble movedOrigMousePtrCoords[2];
 
-	gboolean middlePanning;
-	gboolean middlePanMoved;
-	gdouble middlePanStartMouse[2];
-	gdouble middlePanStartAdj[2];
+	guint panButton;
+	gboolean panMoved;
+	gdouble panStartMouse[2];
+	gdouble panStartAdj[2];
+	gboolean pinchActive;
+	gdouble pinchStartZoom;
+	gboolean zoomAnchorActive, zoomScrollActive;
+	gdouble zoomAnchorImage[2], zoomAnchorViewport[2];
+	guint32 zoomScrollLastTime;
 	gboolean zoomedToFit;
 	gint fittedViewportWidth;
 	gint fittedViewportHeight;

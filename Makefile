@@ -38,13 +38,22 @@ test_datastore: tests/test_datastore.c tests/test_image.c tests/test_perspective
 test: test_datastore
 	./test_datastore
 
+tests/navigation_main.o: main.c main.h strings.h vardefs.h image.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Dmain=g3data2_application_main -c main.c -o $@
+
+test_navigation: tests/test_navigation.c tests/navigation_main.o sort.o points.o drawing.o model.o datastore.o history.o image.o perspective.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $^ $(LIBS)
+
+test-navigation: test_navigation
+	./test_navigation
+
 g3data2.1.gz: g3data2.sgml
 	rm -f *.1
 	onsgmls g3data2.sgml | sgmlspl /usr/share/sgml/docbook/utils-0.6.14/helpers/docbook2man-spec.pl
 	gzip g3data2.1
 
 clean:
-	rm -f *.o tests/*.o g3data2 test_datastore .test-datastore-passed g3data2.1.gz *~ manpage.*
+	rm -f *.o tests/*.o g3data2 test_datastore test_navigation .test-datastore-passed .test-navigation-passed g3data2.1.gz *~ manpage.*
 
 install:
 	install g3data2 $(bindir)

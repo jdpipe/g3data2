@@ -18,6 +18,11 @@ and perspective-correction tests. Image format support comes from the installed
 GdkPixbuf loaders; additional formats such as WebP may require a loader package
 provided by your distro.
 
+`scons test-navigation` (or `make test-navigation`) runs the GTK image-pane
+navigation tests. These need a display; for a headless run, use
+`GDK_BACKEND=x11 xvfb-run -a scons test-navigation` with Xvfb installed. They do
+not require CUnit.
+
 On Ubuntu 24.04, this would be
 
 ```sh
@@ -43,7 +48,11 @@ It's fairly self-explanatory. But to be explicit:
 * each image can have several named, coloured series. The five-row series list shows colour, label, point count, and visibility. Select the active series, use `+` to add one, and double-click or press Enter/F2 to rename. Right-click a series to delete it.
 * a normal image click adds a point. Shift-click toggles a point in the active-series selection; Shift-drag selects several points with a marquee. Drag an already selected marker to move it. The **Edit** menu clears the current series or deletes the selected point(s); Delete and Backspace also delete the selection while the image has focus. Inactive visible series remain on screen in muted colours.
 * content changes are immediately persistent and have a per-tab, memory-only undo/redo history. **Edit** → **Undo** (Ctrl+Z) and **Redo** (Ctrl+Shift+Z) cover point, series, calibration, and applied perspective-correction changes, including switching correction off and on. Closing the tab discards the history but retains its current state in SQLite. Export preferences and zoom/pan are not undoable.
-* images initially use **Zoom to fit**. This remains active across window resizing and maximising until you manually zoom or pan, or choose another zoom level. You can zoom using ctrl-wheel, pan up and down with the mouse wheel, and pan left and right with shift-wheel. Smaller images can be enlarged to 16×; the maximum is reduced automatically for large images to keep the scrollable canvas within a safe size.
+* images initially use **Zoom to fit**. This remains active across window resizing and maximising until you manually zoom or pan, or choose another zoom level. Smaller images can be enlarged to 16×; the maximum is reduced automatically for large images to keep the scrollable canvas within a safe size.
+* on a trackpad, **two-finger scrolling** pans vertically, horizontally, or diagonally, following the system's scroll-direction setting. **Ctrl + two-finger vertical scrolling** zooms smoothly around the pointer. **Pinch/spread** also zooms where the desktop supplies native touchpad pinch events (requires GTK 3.18 or newer).
+* a zoom gesture chooses its anchor once, keeping that image point at the same screen position through zooming and at the zoom limits. Starting in the grey margin uses a point on the image boundary, including its transformed outline when perspective correction is active. Pinch keeps the anchor until the gesture ends; Ctrl-scroll keeps it for a continuous scroll burst, ending on a scroll stop, Ctrl release, or a short pause. Canvas margins adapt to the pane size so extreme zoom-out can preserve the anchor.
+* **Ctrl + left-button drag** or **middle-button drag** grabs and pans the image, including while choosing calibration points or perspective corners. Ctrl + click without dragging does nothing. Mouse-wheel scrolling pans vertically, **Shift + wheel** pans horizontally, and **Ctrl + wheel** zooms around the pointer. **Ctrl + +** / **Ctrl + −** retains keyboard zoom.
+* on GNOME/Wayland, an inactive window may receive scrolling without the Ctrl/Shift modifier state. Activate g3data2 before using modifier-scroll gestures; clicking the title bar does this without adding a point. Native pinch and ordinary two-finger panning do not need keyboard modifiers.
 * zooming in is a good idea when selecting points. g3data2 has sub-pixel precision for identifying and working with point data.
 * calibration, series, sampled positions, and applied perspective settings are saved automatically in `~/.local/share/g3data2/g3data2.sqlite3`. Reopening the same image content restores them, even after the image file is renamed or moved.
 * clipboard exports advertise the `text/tab-separated-values` format explicitly, so they paste directly into spreadsheet cells in applications such as LibreOffice Calc without being mistaken for Markdown. Plain UTF-8 text remains available as a fallback.

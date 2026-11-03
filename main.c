@@ -61,6 +61,7 @@ static const gdouble MAIN_IMAGE_MAX_CANVAS_DIMENSION = 30000.0;
 static const gdouble MAIN_IMAGE_ZOOM_STEP = 1.25;
 static const gdouble ZOOM_AREA_VIEW_MULTIPLIER = 2.0;
 static const gdouble MAIN_IMAGE_CANVAS_MIN_PAD = 512.0;
+static const guint32 ZOOM_SCROLL_PAUSE_MS = 400;
 static const gint MAX_RECENT_FILES = 6;
 static const gint START_TILE_THUMB_W = 160;
 static const gint START_TILE_THUMB_H = 120;
@@ -107,6 +108,7 @@ static void refreshCalibrationWorkflow(struct TabData *tabData);
 static void sourceToImagePixels(const struct TabData *tab, gdouble x, gdouble y, gdouble *u, gdouble *v);
 static void sourceToWidget(const struct TabData *tab, gdouble x, gdouble y, gdouble *u, gdouble *v);
 static void widgetToSource(const struct TabData *tab, gdouble x, gdouble y, gdouble *u, gdouble *v);
+static void getViewportSize(const struct TabData *tabData, gdouble *pageW, gdouble *pageH);
 static void refreshPerspectiveControls(struct TabData *tab);
 static void cancelPerspective(GtkWidget *widget, gpointer data);
 static void refreshPerspectiveMenu(struct TabData *tab);
@@ -870,15 +872,20 @@ gboolean updateZoomArea(GtkWidget *widget, cairo_t *cr, gpointer data) {
 }
 
 static gdouble maximumZoomForImage(const struct TabData *tabData) {
-	gdouble largest_dimension, canvas_limited_zoom;
+	gdouble pageW = 0.0, pageH = 0.0;
+	gdouble padX, padY, canvas_limited_zoom;
 
 	if (tabData == NULL)
 		return MAIN_IMAGE_MAX_ZOOM;
-	largest_dimension = MAX(tabData->XSize, tabData->YSize);
-	if (largest_dimension <= 0.0)
+	if (tabData->XSize <= 0 || tabData->YSize <= 0)
 		return MAIN_IMAGE_MAX_ZOOM;
-	canvas_limited_zoom = (MAIN_IMAGE_MAX_CANVAS_DIMENSION
-			- 2.0 * MAIN_IMAGE_CANVAS_MIN_PAD) / largest_dimension;
+	if (tabData->ViewPort != NULL)
+		getViewportSize(tabData, &pageW, &pageH);
+	padX = MAX(MAIN_IMAGE_CANVAS_MIN_PAD, pageW);
+	padY = MAX(MAIN_IMAGE_CANVAS_MIN_PAD, pageH);
+	canvas_limited_zoom = MIN(
+			(MAIN_IMAGE_MAX_CANVAS_DIMENSION - 2.0 * padX) / tabData->XSize,
+			(MAIN_IMAGE_MAX_CANVAS_DIMENSION - 2.0 * padY) / tabData->YSize);
 	return CLAMP(canvas_limited_zoom, MAIN_IMAGE_MIN_ZOOM,
 			MAIN_IMAGE_MAX_ZOOM);
 }
@@ -966,7 +973,7 @@ static void maybeApplyPendingZoomScroll(struct TabData *tabData) {
 	debugDumpViewportState("maybeApplyPendingZoomScroll:end", tabData);
 }
 
-static void getViewportSize(struct TabData *tabData, gdouble *pageW, gdouble *pageH) {
+static void getViewportSize(const struct TabData *tabData, gdouble *pageW, gdouble *pageH) {
 	GtkAdjustment *hadj, *vadj;
 	gdouble allocW, allocH, pageAdjW, pageAdjH;
 
@@ -992,8 +999,8 @@ static void getViewportSize(struct TabData *tabData, gdouble *pageW, gdouble *pa
 		*pageH = pageAdjH;
 }
 
-static void setMainImageZoom(struct TabData *tabData, gdouble newZoom,
-		gdouble focusX, gdouble focusY) {
+static void setMainImageZoomAround(struct TabData *tabData, gdouble newZoom,
+		gdouble focusX, gdouble focusY, const gdouble *imageAnchor) {
 	GtkAdjustment *hadj, *vadj;
 	gdouble oldZoom;
 	gdouble oldOriginX, oldOriginY;
@@ -1017,21 +1024,29 @@ static void setMainImageZoom(struct TabData *tabData, gdouble newZoom,
 	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
 	hvalue = gtk_adjustment_get_value(hadj);
 	vvalue = gtk_adjustment_get_value(vadj);
+	/* Several smooth events can arrive before GTK resizes the canvas. */
+	if (tabData->pendingZoomScrollOnAdjust) {
+		hvalue = tabData->pendingZoomScrollTarget[0];
+		vvalue = tabData->pendingZoomScrollTarget[1];
+	}
 	getViewportSize(tabData, &pageW, &pageH);
 
-	if (focusX < 0)
+	if (imageAnchor == NULL && focusX < 0)
 		focusX = pageW / 2.0;
-	if (focusY < 0)
+	if (imageAnchor == NULL && focusY < 0)
 		focusY = pageH / 2.0;
 
-	hImgFocus = (hvalue + focusX - oldOriginX) / oldZoom;
-	vImgFocus = (vvalue + focusY - oldOriginY) / oldZoom;
+	hImgFocus = imageAnchor != NULL ? imageAnchor[0]
+			: (hvalue + focusX - oldOriginX) / oldZoom;
+	vImgFocus = imageAnchor != NULL ? imageAnchor[1]
+			: (vvalue + focusY - oldOriginY) / oldZoom;
 
 	tabData->viewZoom = newZoom;
 	newImageW = tabData->XSize * tabData->viewZoom;
 	newImageH = tabData->YSize * tabData->viewZoom;
-	newOriginX = MAIN_IMAGE_CANVAS_MIN_PAD;
-	newOriginY = MAIN_IMAGE_CANVAS_MIN_PAD;
+	/* A whole viewport of margin lets any image anchor stay fixed as it shrinks. */
+	newOriginX = MAX(MAIN_IMAGE_CANVAS_MIN_PAD, pageW);
+	newOriginY = MAX(MAIN_IMAGE_CANVAS_MIN_PAD, pageH);
 	newCanvasW = newImageW + 2.0 * newOriginX;
 	newCanvasH = newImageH + 2.0 * newOriginY;
 
@@ -1077,6 +1092,11 @@ static void setMainImageZoom(struct TabData *tabData, gdouble newZoom,
 			newZoom, focusX, focusY, pageW, pageH, newOriginX, newOriginY, newCanvasW,
 			newCanvasH, hNewValue, vNewValue);
 	debugDumpViewportState("setMainImageZoom:end", tabData);
+}
+
+static void setMainImageZoom(struct TabData *tabData, gdouble newZoom,
+		gdouble focusX, gdouble focusY) {
+	setMainImageZoomAround(tabData, newZoom, focusX, focusY, NULL);
 }
 
 static gdouble calculateZoomToFit(struct TabData *tabData) {
@@ -1177,14 +1197,67 @@ static void zoomToFitAndCenter(struct TabData *tabData) {
 	debugDumpViewportState("zoomToFitAndCenter:end", tabData);
 }
 
-static void disableZoomToFit(struct TabData *tabData) {
+static void leaveZoomToFit(struct TabData *tabData) {
 	if (tabData == NULL)
 		return;
 	tabData->zoomedToFit = FALSE;
 	tabData->fittedViewportWidth = -1;
 	tabData->fittedViewportHeight = -1;
-	tabData->pendingZoomScrollOnAdjust = FALSE;
 	tabData->pendingRecenterOnAdjust = FALSE;
+}
+
+static void endImageZoom(struct TabData *tabData) {
+	tabData->zoomAnchorActive = FALSE;
+	tabData->zoomScrollActive = FALSE;
+	tabData->pinchActive = FALSE;
+}
+
+static void disableZoomToFit(struct TabData *tabData) {
+	leaveZoomToFit(tabData);
+	if (tabData != NULL) {
+		tabData->pendingZoomScrollOnAdjust = FALSE;
+		endImageZoom(tabData);
+	}
+}
+
+static void beginImageZoom(struct TabData *tabData,
+		gdouble widgetX, gdouble widgetY) {
+	GtkAdjustment *hadj, *vadj;
+	gdouble sourceX, sourceY;
+
+	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+	widgetToSource(tabData, widgetX, widgetY, &sourceX, &sourceY);
+	if (!isfinite(sourceX) || !isfinite(sourceY)) {
+		sourceX = (tabData->sourceXSize - 1.0) / 2.0;
+		sourceY = (tabData->sourceYSize - 1.0) / 2.0;
+	}
+	/* Clamp once in the original image, also respecting its transformed outline. */
+	sourceX = CLAMP(sourceX, 0.0, tabData->sourceXSize - 1.0);
+	sourceY = CLAMP(sourceY, 0.0, tabData->sourceYSize - 1.0);
+	sourceToImagePixels(tabData, sourceX, sourceY,
+			&tabData->zoomAnchorImage[0], &tabData->zoomAnchorImage[1]);
+	tabData->zoomAnchorViewport[0] = tabData->viewOrigin[0]
+			+ tabData->zoomAnchorImage[0] * tabData->viewZoom
+			- gtk_adjustment_get_value(hadj);
+	tabData->zoomAnchorViewport[1] = tabData->viewOrigin[1]
+			+ tabData->zoomAnchorImage[1] * tabData->viewZoom
+			- gtk_adjustment_get_value(vadj);
+	tabData->zoomAnchorActive = TRUE;
+}
+
+static void zoomMainImageAt(struct TabData *tabData, gdouble newZoom,
+		gdouble widgetX, gdouble widgetY) {
+	newZoom = clampZoom(tabData, newZoom);
+	/* Further scrolling at the limit must not reposition the image. */
+	if (newZoom == tabData->viewZoom)
+		return;
+	if (!tabData->zoomAnchorActive)
+		beginImageZoom(tabData, widgetX, widgetY);
+	leaveZoomToFit(tabData);
+	setMainImageZoomAround(tabData, newZoom,
+			tabData->zoomAnchorViewport[0], tabData->zoomAnchorViewport[1],
+			tabData->zoomAnchorImage);
 }
 
 static void applyStickyZoomToFit(struct TabData *tabData, gboolean force) {
@@ -2844,6 +2917,45 @@ static void selectPoint(struct TabData *tabData, DataSeries *series,
 	triggerUpdateDrawArea(tabData->drawing_area);
 }
 
+static void setImagePaneCursor(struct TabData *tabData) {
+	GdkWindow *imageWindow;
+	GdkCursor *cursor;
+
+	imageWindow = gtk_widget_get_window(tabData->drawing_area);
+	if (imageWindow == NULL)
+		return;
+	cursor = gdk_cursor_new_for_display(gdk_window_get_display(imageWindow),
+			tabData->panButton != 0 ? GDK_HAND1 : GDK_CROSSHAIR);
+	gdk_window_set_cursor(imageWindow, cursor);
+	g_object_unref(cursor);
+}
+
+static void endImagePan(struct TabData *tabData) {
+	tabData->panButton = 0;
+	tabData->panMoved = FALSE;
+	setImagePaneCursor(tabData);
+}
+
+static void imagePaneRealize(GtkWidget *widget, gpointer data) {
+	(void) widget;
+	setImagePaneCursor(data);
+}
+
+static gboolean imagePaneGrabBroken(GtkWidget *widget,
+		GdkEventGrabBroken *event, gpointer data) {
+	(void) widget;
+	(void) event;
+	endImagePan(data);
+	return FALSE;
+}
+
+static void imagePaneUnmap(GtkWidget *widget, gpointer data) {
+	struct TabData *tabData = data;
+	(void) widget;
+	endImagePan(tabData);
+	endImageZoom(tabData);
+}
+
 /****************************************************************/
 /* When a button is pressed inside the drawing area this 	*/
 /* function is called, it handles axispoints and graphpoints	*/
@@ -2859,6 +2971,27 @@ gint mouseButtonPressEvent(GtkWidget *widget, GdkEventButton *event,
 	(void) widget;
 	tabData = (struct TabData *) data;
 	gtk_widget_grab_focus(tabData->drawing_area);
+
+	if (tabData->panButton != 0)
+		return TRUE;
+	/* Navigation takes priority over sampling, calibration and corner picks. */
+	if (event->button == 2 || (event->button == 1
+			&& (event->state & GDK_CONTROL_MASK) != 0)) {
+		GtkAdjustment *hadj, *vadj;
+		if (tabData->movedPoint != NULL || tabData->leftPressPending)
+			return TRUE;
+		hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+		vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
+		tabData->panButton = event->button;
+		tabData->panMoved = FALSE;
+		endImageZoom(tabData);
+		tabData->panStartMouse[0] = event->x_root;
+		tabData->panStartMouse[1] = event->y_root;
+		tabData->panStartAdj[0] = gtk_adjustment_get_value(hadj);
+		tabData->panStartAdj[1] = gtk_adjustment_get_value(vadj);
+		setImagePaneCursor(tabData);
+		return TRUE;
+	}
 
 	getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
     if (tabData->perspectiveEditing && event->button == 1) {
@@ -2962,16 +3095,6 @@ gint mouseButtonPressEvent(GtkWidget *widget, GdkEventButton *event,
 						"adding a point");
 			}
 		}
-	} else if (event->button == 2) { /* Is the middle button pressed ? */
-		GtkAdjustment *hadj, *vadj;
-		hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
-		vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
-		tabData->middlePanning = TRUE;
-		tabData->middlePanMoved = FALSE;
-		tabData->middlePanStartMouse[0] = event->x_root;
-		tabData->middlePanStartMouse[1] = event->y_root;
-		tabData->middlePanStartAdj[0] = gtk_adjustment_get_value(hadj);
-		tabData->middlePanStartAdj[1] = gtk_adjustment_get_value(vadj);
 	}
 
 	triggerUpdateDrawArea(tabData->drawing_area);
@@ -2998,6 +3121,12 @@ gint mouseButtonReleaseEvent(GtkWidget *widget, GdkEventButton *event,
 
 	(void) widget;
 	tabData = (struct TabData *) data;
+
+	if (tabData->panButton != 0) {
+		if (event->button == tabData->panButton)
+			endImagePan(tabData);
+		return TRUE;
+	}
 
 	getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
 
@@ -3060,11 +3189,6 @@ gint mouseButtonReleaseEvent(GtkWidget *widget, GdkEventButton *event,
 			refreshSeriesWidgets(tabData);
 			triggerUpdateDrawArea(tabData->drawing_area);
 		}
-	} else if (event->button == 2) {
-		if (tabData->middlePanning) {
-			tabData->middlePanning = FALSE;
-			tabData->middlePanMoved = FALSE;
-		}
 	} else if (event->button == 3) {
 	}
 	return TRUE;
@@ -3082,45 +3206,24 @@ gint mouseMotionEvent(GtkWidget *widget, GdkEventMotion *event, gpointer data) {
 	(void) widget;
 	tabData = (struct TabData *) data;
 
-		if (tabData->middlePanning) {
-			GtkAdjustment *hadj, *vadj;
-			gdouble dx, dy, newH, newV, oldH, oldV;
+	if (tabData->panButton != 0) {
+		GtkAdjustment *hadj, *vadj;
+		gdouble dx, dy;
 
+		dx = event->x_root - tabData->panStartMouse[0];
+		dy = event->y_root - tabData->panStartMouse[1];
+		if (!tabData->panMoved && fabs(dx) <= 1.0 && fabs(dy) <= 1.0)
+			return TRUE;
+		tabData->panMoved = TRUE;
+		disableZoomToFit(tabData);
 		hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
 		vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
-
-			dx = event->x_root - tabData->middlePanStartMouse[0];
-			dy = event->y_root - tabData->middlePanStartMouse[1];
-			if (fabs(dx) > 1.0 || fabs(dy) > 1.0) {
-				tabData->middlePanMoved = TRUE;
-				disableZoomToFit(tabData);
-			}
-
-			oldH = gtk_adjustment_get_value(hadj);
-			oldV = gtk_adjustment_get_value(vadj);
-			(void) oldH;
-			(void) oldV;
-			newH = tabData->middlePanStartAdj[0] - dx;
-			newV = tabData->middlePanStartAdj[1] - dy;
-
-			if (newH < gtk_adjustment_get_lower(hadj))
-				newH = gtk_adjustment_get_lower(hadj);
-			if (newH > getAdjustmentUpperBound(hadj))
-				newH = getAdjustmentUpperBound(hadj);
-
-			if (newV < gtk_adjustment_get_lower(vadj))
-				newV = gtk_adjustment_get_lower(vadj);
-			if (newV > getAdjustmentUpperBound(vadj))
-				newV = getAdjustmentUpperBound(vadj);
-
-			gtk_adjustment_set_value(hadj, newH);
-			gtk_adjustment_set_value(vadj, newV);
-			G3DBG(
-					"middlePan: dx=%.2f dy=%.2f oldAdj=(%.2f,%.2f) newAdj=(%.2f,%.2f) upper=(%.2f,%.2f)\n",
-					dx, dy, oldH, oldV, newH, newV, getAdjustmentUpperBound(hadj),
-					getAdjustmentUpperBound(vadj));
-			return TRUE;
-		}
+		gtk_adjustment_set_value(hadj, clampAdjustmentValue(hadj,
+				tabData->panStartAdj[0] - dx));
+		gtk_adjustment_set_value(vadj, clampAdjustmentValue(vadj,
+				tabData->panStartAdj[1] - dy));
+		return TRUE;
+	}
 
 	getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
 	/* on drawing area. */
@@ -3184,6 +3287,7 @@ static gboolean mouseLeaveEvent(GtkWidget *widget, GdkEventCrossing *event,
 	struct TabData *tabData = data;
 	(void) widget;
 	(void) event;
+	endImageZoom(tabData);
 	tabData->mousePointerCoords[0] = -1.0;
 	tabData->mousePointerCoords[1] = -1.0;
 	refreshAxisReader(tabData);
@@ -3196,10 +3300,9 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 	gdouble panStep;
 	gdouble deltaX, deltaY;
 	gdouble newZoom;
-	gdouble imageX, imageY;
-	gdouble focusX, focusY;
 	gboolean ctrlDown, shiftDown;
 
+	(void) widget;
 	tabData = (struct TabData *) data;
 	hadj = gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort));
 	vadj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort));
@@ -3211,40 +3314,36 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 			event->delta_y, ctrlDown, shiftDown, event->x, event->y);
 
 	if (ctrlDown) {
-		disableZoomToFit(tabData);
 		newZoom = tabData->viewZoom;
 		if (event->direction == GDK_SCROLL_UP) {
 			newZoom *= MAIN_IMAGE_ZOOM_STEP;
 		} else if (event->direction == GDK_SCROLL_DOWN) {
 			newZoom /= MAIN_IMAGE_ZOOM_STEP;
 		} else if (event->direction == GDK_SCROLL_SMOOTH) {
-			if (event->delta_y < 0.0) {
-				newZoom *= MAIN_IMAGE_ZOOM_STEP;
-			} else if (event->delta_y > 0.0) {
-				newZoom /= MAIN_IMAGE_ZOOM_STEP;
-			} else {
+			if (!isfinite(event->delta_y) || event->delta_y == 0.0) {
+				if (event->delta_x == 0.0 && event->delta_y == 0.0)
+					endImageZoom(tabData);
 				return TRUE;
 			}
+			/* Preserve small trackpad movements instead of taking a full step. */
+			newZoom *= pow(MAIN_IMAGE_ZOOM_STEP,
+					CLAMP(-event->delta_y, -100.0, 100.0));
 		} else {
 			return TRUE;
 		}
 
-		if (tabData->XSize <= 0 || tabData->YSize <= 0) {
-			focusX = -1.0;
-			focusY = -1.0;
-		} else {
-			getImageCoords(tabData, event->x, event->y, &imageX, &imageY);
-			imageX = CLAMP(imageX, 0.0, tabData->sourceXSize - 1.0);
-			imageY = CLAMP(imageY, 0.0, tabData->sourceYSize - 1.0);
-            sourceToWidget(tabData,imageX,imageY,&focusX,&focusY);
-            focusX -= gtk_adjustment_get_value(hadj);
-            focusY -= gtk_adjustment_get_value(vadj);
+		if (!tabData->zoomScrollActive || (guint32) (event->time
+				- tabData->zoomScrollLastTime) > ZOOM_SCROLL_PAUSE_MS) {
+			endImageZoom(tabData);
+			beginImageZoom(tabData, event->x, event->y);
+			tabData->zoomScrollActive = TRUE;
 		}
-
-		setMainImageZoom(tabData, newZoom, focusX, focusY);
+		tabData->zoomScrollLastTime = event->time;
+		zoomMainImageAt(tabData, newZoom, event->x, event->y);
 		return TRUE;
 	}
 
+	endImageZoom(tabData);
 	panStep = MAX(30.0, gtk_adjustment_get_page_size(vadj) * 0.08);
 	deltaX = 0.0;
 	deltaY = 0.0;
@@ -3258,17 +3357,18 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 	} else if (event->direction == GDK_SCROLL_RIGHT) {
 		deltaX = panStep;
 	} else if (event->direction == GDK_SCROLL_SMOOTH) {
+		if (!isfinite(event->delta_x) || !isfinite(event->delta_y))
+			return TRUE;
 		deltaX = event->delta_x * panStep;
 		deltaY = event->delta_y * panStep;
 	}
 
-	if (shiftDown && deltaX == 0.0)
-		deltaX = deltaY;
-
-	if (!shiftDown && event->direction != GDK_SCROLL_LEFT
-			&& event->direction != GDK_SCROLL_RIGHT)
-		deltaX = 0.0;
-	if (deltaX != 0.0 || (deltaY != 0.0 && !shiftDown))
+	if (shiftDown) {
+		if (deltaX == 0.0)
+			deltaX = deltaY;
+		deltaY = 0.0;
+	}
+	if (deltaX != 0.0 || deltaY != 0.0)
 		disableZoomToFit(tabData);
 
 	if (deltaX != 0.0) {
@@ -3282,7 +3382,7 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 		gtk_adjustment_set_value(hadj, newH);
 	}
 
-	if (deltaY != 0.0 && !shiftDown) {
+	if (deltaY != 0.0) {
 		gdouble newV = gtk_adjustment_get_value(vadj) + deltaY;
 		gdouble vLower = gtk_adjustment_get_lower(vadj);
 		gdouble vUpper = getAdjustmentUpperBound(vadj);
@@ -3295,6 +3395,40 @@ gint mouseScrollEvent(GtkWidget *widget, GdkEventScroll *event, gpointer data) {
 
 	return TRUE;
 }
+
+#if GTK_CHECK_VERSION(3, 18, 0)
+static gboolean touchpadPinchEvent(GtkWidget *widget, GdkEvent *event, gpointer data) {
+	struct TabData *tabData = data;
+	GdkEventTouchpadPinch *pinch;
+	(void) widget;
+
+	if (event->type != GDK_TOUCHPAD_PINCH)
+		return FALSE;
+	pinch = &event->touchpad_pinch;
+	if (pinch->n_fingers != 2 || tabData->panButton != 0)
+		return FALSE;
+	switch (pinch->phase) {
+	case GDK_TOUCHPAD_GESTURE_PHASE_BEGIN:
+		endImageZoom(tabData);
+		beginImageZoom(tabData, pinch->x, pinch->y);
+		tabData->pinchActive = TRUE;
+		tabData->pinchStartZoom = tabData->viewZoom;
+		break;
+	case GDK_TOUCHPAD_GESTURE_PHASE_UPDATE:
+		if (tabData->pinchActive && isfinite(pinch->scale)
+				&& pinch->scale > 0.0
+				&& tabData->pinchStartZoom * pinch->scale != tabData->viewZoom)
+			zoomMainImageAt(tabData, tabData->pinchStartZoom * pinch->scale,
+					pinch->x, pinch->y);
+		break;
+	case GDK_TOUCHPAD_GESTURE_PHASE_END:
+	case GDK_TOUCHPAD_GESTURE_PHASE_CANCEL:
+		endImageZoom(tabData);
+		break;
+	}
+	return TRUE;
+}
+#endif
 
 static gboolean scrollbarChangeValue(GtkRange *range, GtkScrollType scroll,
 		gdouble value, gpointer data) {
@@ -3698,6 +3832,12 @@ gint keyPressEvent(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 gint keyReleaseEvent(GtkWidget *widget, GdkEventKey *event, gpointer data) {
 	(void) widget;
 	(void) data;
+	if ((event->keyval == GDK_KEY_Control_L || event->keyval == GDK_KEY_Control_R)
+			&& mainnotebook != NULL) {
+		struct TabData *tabData = getCurrentTabData();
+		if (tabData != NULL)
+			endImageZoom(tabData);
+	}
 	if (event->keyval == GDK_KEY_Alt_L || event->keyval == GDK_KEY_Alt_R) {
 		axisReaderAltHeld = FALSE;
 		axisReaderChorded = FALSE;
@@ -3711,6 +3851,11 @@ static gboolean windowFocusOutEvent(GtkWidget *widget, GdkEventFocus *event,
 	(void) widget;
 	(void) event;
 	(void) data;
+	if (mainnotebook != NULL) {
+		struct TabData *tabData = getCurrentTabData();
+		if (tabData != NULL)
+			endImageZoom(tabData);
+	}
 	axisReaderAltHeld = FALSE;
 	axisReaderChorded = FALSE;
 	hideAxisReader();
@@ -3725,8 +3870,6 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 		gdouble Scale, gdouble maxX, gdouble maxY, struct TabData *tabData) {
 
 	gdouble mScale;
-	GdkCursor *cursor;
-	GdkDisplay *display;
 	GtkWidget *dialog;
 	GError *error = NULL;
 
@@ -3793,6 +3936,12 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 	tabData->originalImage = cairo_surface_reference(tabData->image);
 	tabData->drawing_area = gtk_drawing_area_new(); /* Create new drawing area */
 	gtk_widget_set_can_focus(tabData->drawing_area, TRUE);
+	g_signal_connect(tabData->ViewPort, "size-allocate",
+			G_CALLBACK(viewportSizeAllocateEvent), tabData);
+	g_signal_connect(gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort)),
+			"changed", G_CALLBACK(adjustmentChangedEvent), tabData);
+	g_signal_connect(gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort)),
+			"changed", G_CALLBACK(adjustmentChangedEvent), tabData);
 	tabData->viewOrigin[0] = MAIN_IMAGE_CANVAS_MIN_PAD;
 	tabData->viewOrigin[1] = MAIN_IMAGE_CANVAS_MIN_PAD;
 	tabData->viewCanvasSize[0] = tabData->XSize + 2.0 * MAIN_IMAGE_CANVAS_MIN_PAD;
@@ -3819,13 +3968,24 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 
 	g_signal_connect(G_OBJECT (tabData->drawing_area), "scroll_event",
 			G_CALLBACK (mouseScrollEvent), tabData);
+	g_signal_connect(tabData->drawing_area, "grab-broken-event",
+			G_CALLBACK(imagePaneGrabBroken), tabData);
+	g_signal_connect(tabData->drawing_area, "unmap",
+			G_CALLBACK(imagePaneUnmap), tabData);
+	g_signal_connect(tabData->drawing_area, "realize",
+			G_CALLBACK(imagePaneRealize), tabData);
 
 	gtk_widget_set_events(
 			tabData->drawing_area,
 			GDK_EXPOSURE_MASK | /* Set the events active */
 			GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK
 					| GDK_POINTER_MOTION_MASK | GDK_POINTER_MOTION_HINT_MASK
-					| GDK_LEAVE_NOTIFY_MASK | GDK_SCROLL_MASK);
+					| GDK_LEAVE_NOTIFY_MASK | GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
+#if GTK_CHECK_VERSION(3, 18, 0)
+	gtk_widget_add_events(tabData->drawing_area, GDK_TOUCHPAD_GESTURE_MASK);
+	g_signal_connect(tabData->drawing_area, "event",
+			G_CALLBACK(touchpadPinchEvent), tabData);
+#endif
 
 	gtk_container_add((GtkContainer *) drawing_area_alignment,
 			tabData->drawing_area);
@@ -3833,11 +3993,7 @@ gint addImageToTab(GtkWidget *drawing_area_alignment, char *filename,
 	gtk_widget_show(tabData->drawing_area);
 	debugDumpViewportState("addImageToTab:after_drawing_area_show", tabData);
 
-	display = gtk_widget_get_display(tabData->drawing_area);
-	cursor = gdk_cursor_new_for_display(display, GDK_CROSSHAIR);
-	gdk_window_set_cursor(gtk_widget_get_parent_window(tabData->drawing_area),
-			cursor);
-	g_object_unref(cursor);
+	setImagePaneCursor(tabData);
 
 	tabData->zoomedToFit = TRUE;
 	tabData->fittedViewportWidth = -1;
@@ -4107,8 +4263,9 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	tabData->calibration_status_label = NULL;
 	tabData->calibration_cancel_button = NULL;
 
-	tabData->middlePanning = FALSE;
-	tabData->middlePanMoved = FALSE;
+	tabData->panButton = 0;
+	tabData->panMoved = FALSE;
+	tabData->pinchActive = FALSE;
 	tabData->zoomedToFit = FALSE;
 	tabData->fittedViewportWidth = -1;
 	tabData->fittedViewportHeight = -1;
@@ -4357,14 +4514,6 @@ gint setupNewTab(char *filename, gdouble Scale, gdouble maxX, gdouble maxY,
 	gtk_scrolled_window_set_policy((GtkScrolledWindow *) ScrollWindow,
 			GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
 	tabData->ViewPort = gtk_viewport_new(NULL, NULL);
-	g_signal_connect(G_OBJECT(tabData->ViewPort), "size-allocate",
-			G_CALLBACK(viewportSizeAllocateEvent), tabData);
-	g_signal_connect(
-			G_OBJECT(gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(tabData->ViewPort))),
-			"changed", G_CALLBACK(adjustmentChangedEvent), tabData);
-	g_signal_connect(
-			G_OBJECT(gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(tabData->ViewPort))),
-			"changed", G_CALLBACK(adjustmentChangedEvent), tabData);
 
 	gtk_box_pack_start(GTK_BOX (brvbox), ScrollWindow, TRUE, TRUE, 0);
 	drawing_area_alignment = g3AlignmentNew(0, 0, 0, 0);

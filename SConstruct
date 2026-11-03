@@ -93,6 +93,22 @@ sources = ["main.c", "sort.c", "points.c", "drawing.c", "model.c", "datastore.c"
 application = env.Program(target="g3data2", source=sources)
 Default(application)
 
+navigation_main = env.Object(
+    target="tests/navigation_main.o", source="main.c",
+    CPPDEFINES=env.get("CPPDEFINES", []) + [("main", "g3data2_application_main")],
+)
+navigation_tests = env.Program(
+    target="test_navigation",
+    source=["tests/test_navigation.c", navigation_main] + sources[1:],
+)
+navigation_action = env.Command(
+    target=".test-navigation-passed",
+    source=navigation_tests,
+    action="./$SOURCE && touch $TARGET",
+)
+AlwaysBuild(navigation_action)
+Alias("test-navigation", navigation_action)
+
 if have_cunit:
     test_env = env.Clone()
     test_env.ParseConfig("pkg-config --cflags --libs cunit")
